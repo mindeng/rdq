@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -42,7 +43,9 @@ type QueueConfig struct {
 	// ConsumerBRPOPTimeout is the timeout for the blocking pop operation.
 	// A small non-zero timeout allows the consumer to check context cancellation periodically.
 	ConsumerBRPOPTimeout time.Duration
-	KeyPrefix            string // Prefix for all internal Redis keys
+
+	KeyPrefix string
+	Logger    *slog.Logger // Logger instance for this queue
 }
 
 // DefaultQueueConfig returns a QueueConfig with default values.
@@ -52,7 +55,38 @@ func DefaultQueueConfig() QueueConfig {
 		ProducerWaitTimeout:  60 * time.Second,
 		ConsumerBRPOPTimeout: 1 * time.Second,
 		KeyPrefix:            defaultKeyPrefix,
+		Logger:               slog.New(slog.NewJSONHandler(os.Stdout, nil)), // Default logger
 	}
+}
+
+// WithTaskExpiry sets the TaskExpiry duration.
+func (qc QueueConfig) WithTaskExpiry(d time.Duration) QueueConfig {
+	qc.TaskExpiry = d
+	return qc
+}
+
+// WithProducerWaitTimeout sets the ProducerWaitTimeout duration.
+func (qc QueueConfig) WithProducerWaitTimeout(d time.Duration) QueueConfig {
+	qc.ProducerWaitTimeout = d
+	return qc
+}
+
+// WithConsumerBRPOPTimeout sets the ConsumerBRPOPTimeout duration.
+func (qc QueueConfig) WithConsumerBRPOPTimeout(d time.Duration) QueueConfig {
+	qc.ConsumerBRPOPTimeout = d
+	return qc
+}
+
+// WithKeyPrefix sets the KeyPrefix string.
+func (qc QueueConfig) WithKeyPrefix(p string) QueueConfig {
+	qc.KeyPrefix = p
+	return qc
+}
+
+// WithLogger sets a custom slog.Logger.
+func (qc QueueConfig) WithLogger(l *slog.Logger) QueueConfig {
+	qc.Logger = l
+	return qc
 }
 
 // Task represents a task payload.
@@ -71,16 +105,21 @@ type Result struct {
 // Queue represents the message queue.
 type Queue struct {
 	redisClient redis.UniversalClient
-	config      QueueConfig
+	config      QueueConfig // Holds configuration including the logger
 }
 
-// NewQueue creates a new Queue instance using an existing redis.UniversalClient and configuration.
+// NewQueue creates a new Queue instance.
+// If config.Logger is nil, a default slog.Logger will be used.
 func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
-	// Ensure the key prefix ends with a colon for consistent formatting
 	if config.KeyPrefix != "" && config.KeyPrefix[len(config.KeyPrefix)-1] != ':' {
 		config.KeyPrefix += ":"
 	} else if config.KeyPrefix == "" {
 		config.KeyPrefix = defaultKeyPrefix
+	}
+
+	// Ensure logger is initialized
+	if config.Logger == nil {
+		config.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)) // Default if not provided
 	}
 
 	return &Queue{
@@ -89,7 +128,6 @@ func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
 	}
 }
 
-// getKey formats an internal Redis key with the configured prefix.
 func (q *Queue) getKey(format string, args ...interface{}) string {
 	prefixedFormat := q.config.KeyPrefix + format
 	return fmt.Sprintf(prefixedFormat, args...)
@@ -133,8 +171,10 @@ end
 // Otherwise, it returns a channel that will deliver the result or an error later.
 // Returns (immediateResult *Result, resultChannel <-chan *Result, err error).
 func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Result, <-chan *Result, error) {
+	logger := q.config.Logger // Use logger from config
 	payloadJSON, err := json.Marshal(json.RawMessage(payload))
 	if err != nil {
+		logger.Error("Failed to marshal payload", "taskID", taskID, "err", err)
 		return nil, nil, fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
@@ -145,44 +185,48 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 
 	setOk, err := q.redisClient.SetNX(ctx, statusKey, taskStatusPending, q.config.TaskExpiry).Result()
 	if err != nil {
+		logger.Error("Redis SETNX error for task", "taskID", taskID, "key", statusKey, "err", err)
 		return nil, nil, fmt.Errorf("redis SETNX error for task %s: %w", taskID, err)
 	}
 
 	var action string
 	if setOk {
 		action = "queued"
-		log.Printf("Task %s: Status set to pending. Storing payload and queueing.", taskID)
+		logger.Info("Task status set to pending. Storing payload and queueing.", "taskID", taskID)
 
 		pipe := q.redisClient.Pipeline()
 		pipe.Set(ctx, payloadKey, payloadJSON, q.config.TaskExpiry)
 		pipe.LPush(ctx, queueKey, taskID)
 		_, execErr := pipe.Exec(ctx)
 		if execErr != nil {
-			log.Printf("Task %s: CRITICAL - Failed to store payload or queue after setting pending: %v", taskID, execErr)
+			logger.Error("CRITICAL - Failed to store payload or queue after setting pending", "taskID", taskID, "err", execErr)
 			q.redisClient.Set(ctx, statusKey, taskStatusFailed, q.config.TaskExpiry) // Best effort
 			return nil, nil, fmt.Errorf("failed to store payload or queue task %s: %w", taskID, execErr)
 		}
-		log.Printf("Task %s: Payload stored and queued.", taskID)
+		logger.Info("Payload stored and task queued.", "taskID", taskID)
 	} else {
 		status, getErr := q.redisClient.Get(ctx, statusKey).Result()
 		if getErr != nil && getErr != redis.Nil {
+			logger.Error("Failed to get status for existing task", "taskID", taskID, "key", statusKey, "err", getErr)
 			return nil, nil, fmt.Errorf("failed to get status for existing task %s: %w", taskID, getErr)
 		}
 
 		switch status {
 		case taskStatusCompleted, taskStatusFailed:
 			action = "completed_or_failed"
-			log.Printf("Task %s: Already %s, fetching result directly.", taskID, status)
+			logger.Info("Task already completed or failed, fetching result directly.", "taskID", taskID, "status", status)
 			resultData, getResErr := q.redisClient.Get(ctx, resultKey).Bytes()
 			if getResErr == redis.Nil {
+				logger.Warn("Task status is completed/failed, but result not found (likely expired or inconsistent)", "taskID", taskID, "status", status, "resultKey", resultKey)
 				return nil, nil, fmt.Errorf("task %s status is %s, but result not found (likely expired or inconsistent)", taskID, status)
 			} else if getResErr != nil {
+				logger.Error("Failed to get result for completed/failed task", "taskID", taskID, "status", status, "resultKey", resultKey, "err", getResErr)
 				return nil, nil, fmt.Errorf("failed to get result for task %s (%s): %w", taskID, status, getResErr)
 			}
 
 			var result Result
 			if umErr := json.Unmarshal(resultData, &result); umErr != nil {
-				log.Printf("Warning: Failed to unmarshal direct result for task %s, error: %v", taskID, umErr)
+				logger.Warn("Failed to unmarshal direct result for task", "taskID", taskID, "err", umErr)
 				result.TaskID = taskID
 				result.Error = fmt.Sprintf("failed to unmarshal direct result: %v", umErr)
 			}
@@ -190,12 +234,12 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 
 		case taskStatusPending, taskStatusProcessing:
 			action = "waiting"
-			log.Printf("Task %s: Already pending or processing, waiting for result via stream.", taskID)
+			logger.Info("Task already pending or processing, waiting for result via stream.", "taskID", taskID, "status", status)
 		case "":
-			log.Printf("Task %s: Status key did not exist after SETNX returned false. Race condition? Treating as waiting.", taskID)
+			logger.Warn("Status key did not exist after SETNX returned false. Race condition? Treating as waiting.", "taskID", taskID, "statusKey", statusKey)
 			action = "waiting"
 		default:
-			log.Printf("Task %s: Unexpected status '%s'. Treating as waiting.", taskID, status)
+			logger.Warn("Unexpected task status. Treating as waiting.", "taskID", taskID, "status", status)
 			action = "waiting"
 		}
 	}
@@ -205,87 +249,81 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 		streamKey := q.getKey(keyStreamResultFormat, taskID)
 
 		go func() {
+			// Use the logger from the Queue instance within the goroutine
+			goroutineLogger := q.config.Logger
 			defer close(resultCh)
 
 			waitOverallCtx, cancelOverallWait := context.WithTimeout(ctx, q.config.ProducerWaitTimeout)
 			defer cancelOverallWait()
 
-			log.Printf("Task %s: Attempting to fetch existing result or wait on stream %s", taskID, streamKey)
+			goroutineLogger.Info("Attempting to fetch existing result or wait on stream", "taskID", taskID, "streamKey", streamKey)
 
-			// 1. Check for existing recent result (for late listeners or quick completions)
 			existingMsgs, revRangeErr := q.redisClient.XRevRangeN(waitOverallCtx, streamKey, "+", "-", 1).Result()
 			if revRangeErr == nil && len(existingMsgs) == 1 {
 				msg := existingMsgs[0]
 				var res Result
 				if val, ok := msg.Values["result"].(string); ok {
 					if umErr := json.Unmarshal([]byte(val), &res); umErr == nil {
-						log.Printf("Task %s: Fetched existing result from stream via XRevRange: ID %s", taskID, msg.ID)
+						goroutineLogger.Info("Fetched existing result from stream via XRevRange", "taskID", taskID, "streamMessageID", msg.ID)
 						resultCh <- &res
 						return
 					} else {
-						log.Printf("Task %s: Failed to unmarshal existing stream result from XRevRange: %v. Will proceed to XREAD.", taskID, umErr)
+						goroutineLogger.Warn("Failed to unmarshal existing stream result from XRevRange. Will proceed to XREAD.", "taskID", taskID, "streamMessageID", msg.ID, "err", umErr)
 					}
 				} else {
-					log.Printf("Task %s: Existing stream message 'result' field not a string (XRevRange). Will proceed to XREAD.", taskID)
+					goroutineLogger.Warn("Existing stream message 'result' field not a string (XRevRange). Will proceed to XREAD.", "taskID", taskID, "streamMessageID", msg.ID)
 				}
 			} else if revRangeErr != nil && revRangeErr != redis.Nil {
-				log.Printf("Task %s: Error checking existing stream result (XRevRange): %v", taskID, revRangeErr)
+				goroutineLogger.Error("Error checking existing stream result (XRevRange)", "taskID", taskID, "streamKey", streamKey, "err", revRangeErr)
 				resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("error checking existing stream result: %v", revRangeErr)}
 				return
 			}
-			// If XRevRange returned redis.Nil, or message was unmarshalable/invalid, proceed to XREAD.
 
-			log.Printf("Task %s: No valid immediate result from XRevRange, proceeding to XREAD on stream %s (timeout: %v)", taskID, streamKey, q.config.ProducerWaitTimeout)
-
-			// 2. Wait for messages.
-			// If XRevRange found nothing (or bad data), we read from "0-0" to catch any message,
-			// including one that might have arrived between XRevRange and XRead.
-			// This addresses the race condition when '$' would have been used.
-			// We only want one message from the stream for this wait.
+			goroutineLogger.Info("No valid immediate result from XRevRange, proceeding to XREAD.", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout)
 			xreadStartID := "0-0"
-
 			xreadArgs := &redis.XReadArgs{
-				Streams: []string{streamKey, xreadStartID}, // Read messages with ID > xreadStartID (for "0-0", means all messages from start)
-				Count:   1,                                 // We only need the first one that appears.
-				Block:   q.config.ProducerWaitTimeout,      // Redis-level block timeout
+				Streams: []string{streamKey, xreadStartID},
+				Count:   1,
+				Block:   q.config.ProducerWaitTimeout,
 			}
 
 			cmdResult, readErr := q.redisClient.XRead(waitOverallCtx, xreadArgs).Result()
-
 			if readErr != nil {
+				errMsg := fmt.Sprintf("wait for stream message timed out after %v", q.config.ProducerWaitTimeout)
 				if errors.Is(readErr, context.DeadlineExceeded) || (waitOverallCtx.Err() == context.DeadlineExceeded) {
-					log.Printf("Task %s: Wait for stream message timed out after %v (context deadline)", taskID, q.config.ProducerWaitTimeout)
-					resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("wait for stream message timed out after %v", q.config.ProducerWaitTimeout)}
+					goroutineLogger.Warn("Wait for stream message timed out (context deadline)", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout, "err", readErr)
 				} else if errors.Is(readErr, redis.Nil) {
-					log.Printf("Task %s: Wait for stream message timed out (XRead redis.Nil) after %v", taskID, q.config.ProducerWaitTimeout)
-					resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("wait for stream message timed out after %v", q.config.ProducerWaitTimeout)}
+					goroutineLogger.Warn("Wait for stream message timed out (XRead redis.Nil)", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout)
 				} else {
-					log.Printf("Task %s: Failed to read from stream: %v", taskID, readErr)
-					resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("failed to read from stream: %v", readErr)}
+					goroutineLogger.Error("Failed to read from stream", "taskID", taskID, "streamKey", streamKey, "err", readErr)
+					errMsg = fmt.Sprintf("failed to read from stream: %v", readErr)
 				}
+				resultCh <- &Result{TaskID: taskID, Error: errMsg}
 				return
 			}
 
 			if len(cmdResult) > 0 && len(cmdResult[0].Messages) > 0 {
 				msg := cmdResult[0].Messages[0]
-				log.Printf("Task %s: Received stream message: ID %s", taskID, msg.ID)
+				goroutineLogger.Info("Received stream message", "taskID", taskID, "streamKey", streamKey, "streamMessageID", msg.ID)
 				var res Result
 				if val, ok := msg.Values["result"].(string); ok {
 					if umErr := json.Unmarshal([]byte(val), &res); umErr != nil {
-						log.Printf("Task %s: Failed to unmarshal received stream message: %v", taskID, umErr)
+						goroutineLogger.Error("Failed to unmarshal received stream message", "taskID", taskID, "streamMessageID", msg.ID, "err", umErr)
 						resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("failed to unmarshal stream message: %v", umErr)}
 					} else {
 						resultCh <- &res
 					}
 				} else {
-					log.Printf("Task %s: Received stream message 'result' field not a string.", taskID)
+					goroutineLogger.Error("Received stream message 'result' field not a string", "taskID", taskID, "streamMessageID", msg.ID)
 					resultCh <- &Result{TaskID: taskID, Error: "received stream message 'result' field not a string"}
 				}
 			} else {
-				log.Printf("Task %s: XRead returned no message and no error, implies timeout or context done (unexpected).", taskID)
 				errMsg := "received no message from stream unexpectedly"
 				if waitOverallCtx.Err() == context.DeadlineExceeded {
+					goroutineLogger.Warn("XRead returned no message and no error, context deadline exceeded", "taskID", taskID, "streamKey", streamKey)
 					errMsg = fmt.Sprintf("wait for stream message timed out after %v (context check)", q.config.ProducerWaitTimeout)
+				} else {
+					goroutineLogger.Error("XRead returned no message and no error (unexpected)", "taskID", taskID, "streamKey", streamKey)
 				}
 				resultCh <- &Result{TaskID: taskID, Error: errMsg}
 			}
@@ -293,18 +331,22 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 		return nil, resultCh, nil
 	}
 
+	logger.Error("Unexpected state after processing task", "taskID", taskID, "action", action)
 	return nil, nil, fmt.Errorf("unexpected state after processing task %s, action: %s", taskID, action)
 }
 
 // ProduceBlock calls Produce and blocks until the result is available or an error occurs.
 func (q *Queue) ProduceBlock(ctx context.Context, taskID string, payload []byte) (*Result, error) {
+	logger := q.config.Logger // Use logger from config
 	immediateResult, resultCh, err := q.Produce(ctx, taskID, payload)
 	if err != nil {
+		logger.Error("Produce failed in ProduceBlock", "taskID", taskID, "err", err)
 		return nil, fmt.Errorf("produce failed: %w", err)
 	}
 
 	if immediateResult != nil {
 		if immediateResult.Error != "" {
+			logger.Warn("ProduceBlock returning immediate result with error", "taskID", taskID, "resultError", immediateResult.Error)
 			return immediateResult, errors.New(immediateResult.Error)
 		}
 		return immediateResult, nil
@@ -314,19 +356,24 @@ func (q *Queue) ProduceBlock(ctx context.Context, taskID string, payload []byte)
 		select {
 		case finalResult, ok := <-resultCh:
 			if !ok {
+				logger.Error("Result channel closed unexpectedly in ProduceBlock", "taskID", taskID)
 				return nil, errors.New("result channel closed unexpectedly")
 			}
 			if finalResult == nil {
+				logger.Error("Result channel delivered nil result in ProduceBlock", "taskID", taskID)
 				return nil, errors.New("result channel delivered nil result")
 			}
 			if finalResult.Error != "" {
+				logger.Warn("ProduceBlock returning final result with error", "taskID", taskID, "resultError", finalResult.Error)
 				return finalResult, errors.New(finalResult.Error)
 			}
 			return finalResult, nil
 		case <-ctx.Done():
+			logger.Warn("ProduceBlock cancelled by context", "taskID", taskID, "err", ctx.Err())
 			return nil, fmt.Errorf("produce block cancelled by context: %w", ctx.Err())
 		}
 	}
+	logger.Error("Produce returned neither immediate result nor channel in ProduceBlock", "taskID", taskID)
 	return nil, errors.New("produce returned neither immediate result nor channel")
 }
 
@@ -335,37 +382,39 @@ type ProcessTaskFunc func(ctx context.Context, taskID string, payload []byte) ([
 
 // Consume processes tasks from the queue. Should be run in a goroutine.
 func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
+	logger := q.config.Logger // Use logger from config
 	queueKey := q.getKey(keyQueue)
+	logger.Info("Consumer starting", "queueKey", queueKey)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Consumer context cancelled, shutting down.")
+			logger.Info("Consumer context cancelled, shutting down.", "err", ctx.Err())
 			return
 		default:
 		}
 
 		taskIDs, err := q.redisClient.BRPop(ctx, q.config.ConsumerBRPOPTimeout, queueKey).Result()
 		if err != nil {
-			if errors.Is(err, redis.Nil) {
+			if errors.Is(err, redis.Nil) { // Timeout
 				continue
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				log.Println("Consumer context cancelled or timed out during BRPOP, shutting down.")
+				logger.Info("Consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
 				return
 			}
-			log.Printf("BRPOP error: %v. Retrying in 5 seconds.", err)
+			logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		if len(taskIDs) != 2 {
-			log.Printf("Unexpected BRPOP result: %v", taskIDs)
+			logger.Error("Unexpected BRPOP result", "result", taskIDs)
 			continue
 		}
 
 		taskID := taskIDs[1]
-		log.Printf("Consumer picked up task: %s", taskID)
+		logger.Info("Consumer picked up task", "taskID", taskID)
 
 		statusKey := q.getKey(keyStatus, taskID)
 		payloadKey := q.getKey(keyPayload, taskID)
@@ -376,19 +425,19 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 			taskID, taskStatusPending, taskStatusProcessing, int(q.config.TaskExpiry.Seconds()), taskStatusProcessing, taskStatusCompleted,
 		).Result()
 		if err != nil {
-			log.Printf("Task %s: Consume script error: %v. Skipping task.", taskID, err)
+			logger.Error("Consume script error, skipping task.", "taskID", taskID, "err", err)
 			continue
 		}
 
 		actionStr, ok := consumeAction.(string)
 		if !ok {
-			log.Printf("Task %s: Consume script returned non-string action: %T. Skipping task.", taskID, consumeAction)
+			logger.Error("Consume script returned non-string action, skipping task.", "taskID", taskID, "actionType", fmt.Sprintf("%T", consumeAction))
 			continue
 		}
-		log.Printf("Task %s: Consume script returned action: %s", taskID, actionStr)
+		logger.Info("Consume script returned action", "taskID", taskID, "action", actionStr)
 
 		if actionStr != "processing" {
-			log.Printf("Task %s: Not processing due to status '%s'. Skipping.", taskID, actionStr)
+			logger.Info("Not processing task due to status from script, skipping.", "taskID", taskID, "action", actionStr)
 			continue
 		}
 
@@ -396,27 +445,27 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 		if err != nil {
 			errMsg := fmt.Sprintf("payload error: %v", err)
 			if errors.Is(err, redis.Nil) {
-				log.Printf("Task %s: Payload not found (likely expired). Marking failed.", taskID)
+				logger.Warn("Payload not found (likely expired), marking failed.", "taskID", taskID, "payloadKey", payloadKey)
 				errMsg = "payload expired before processing"
 			} else {
-				log.Printf("Task %s: Failed to get payload: %v. Marking failed.", taskID, err)
+				logger.Error("Failed to get payload, marking failed.", "taskID", taskID, "payloadKey", payloadKey, "err", err)
 			}
 			q.updateStatusAndStreamResult(ctx, taskID, taskStatusFailed, &Result{TaskID: taskID, Error: errMsg})
 			continue
 		}
 
-		log.Printf("Task %s: Executing processing logic...", taskID)
+		logger.Info("Executing processing logic for task...", "taskID", taskID)
 		resultData, processErr := processFunc(ctx, taskID, payloadData)
 
 		var finalStatus string
 		var taskResult *Result
 
 		if processErr != nil {
-			log.Printf("Task %s: Processing failed: %v", taskID, processErr)
+			logger.Error("Task processing failed", "taskID", taskID, "err", processErr)
 			finalStatus = taskStatusFailed
 			taskResult = &Result{TaskID: taskID, Error: processErr.Error()}
 		} else {
-			log.Printf("Task %s: Processing successful.", taskID)
+			logger.Info("Task processing successful", "taskID", taskID)
 			finalStatus = taskStatusCompleted
 			taskResult = &Result{TaskID: taskID, Data: json.RawMessage(resultData)}
 		}
@@ -426,6 +475,7 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 
 // updateStatusAndStreamResult updates status, stores result, adds to stream, and sets stream expiry.
 func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, status string, result *Result) {
+	logger := q.config.Logger // Use logger from config
 	resultKey := q.getKey(keyResult, taskID)
 	statusKey := q.getKey(keyStatus, taskID)
 	streamKey := q.getKey(keyStreamResultFormat, taskID)
@@ -434,7 +484,7 @@ func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, 
 
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
-		log.Printf("Task %s: Failed to marshal final result for storage: %v", taskID, err)
+		logger.Error("Failed to marshal final result for storage", "taskID", taskID, "err", err)
 		errorResult := &Result{TaskID: taskID, Error: fmt.Sprintf("internal: failed to marshal final result: %v", err)}
 		resultJSON, _ = json.Marshal(errorResult)
 	}
@@ -452,16 +502,22 @@ func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, 
 		}
 		pipe.XAdd(ctx, xaddArgs)
 		pipe.Expire(ctx, streamKey, q.config.TaskExpiry)
-		log.Printf("Task %s: Queued XADD to stream %s and EXPIRE for %v", taskID, streamKey, q.config.TaskExpiry)
+		logger.Info("Queued XADD to stream and EXPIRE for stream key", "taskID", taskID, "streamKey", streamKey, "expiry", q.config.TaskExpiry)
 	} else {
-		log.Printf("Task %s: resultJSON is nil after attempting to marshal error, not adding to stream.", taskID)
+		logger.Error("resultJSON is nil after attempting to marshal error, not adding to stream.", "taskID", taskID)
 	}
 
-	_, execErr := pipe.Exec(ctx)
+	cmders, execErr := pipe.Exec(ctx)
 	if execErr != nil {
-		log.Printf("Task %s: Pipeline failed for status/result/stream update: %v", taskID, execErr)
+		logger.Error("Pipeline failed for status/result/stream update", "taskID", taskID, "err", execErr)
+		// Log individual command errors if available
+		for i, cmder := range cmders {
+			if cmder.Err() != nil {
+				logger.Error("Pipeline command failed", "taskID", taskID, "commandIndex", i, "commandName", cmder.Name(), "commandErr", cmder.Err())
+			}
+		}
 	} else {
-		log.Printf("Task %s: Status updated to %s, result stored, and result streamed to %s.", taskID, status, streamKey)
+		logger.Info("Status updated, result stored, and result streamed.", "taskID", taskID, "newStatus", status, "streamKey", streamKey)
 	}
 }
 
