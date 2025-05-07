@@ -309,7 +309,7 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	require.NotNil(t, resultCh1, "First Produce call should return a channel")
 
 	// Give the consumer a moment to pick up the task and start processing
-	time.Sleep(50 * time.Millisecond)
+	// time.Sleep(50 * time.Millisecond)
 
 	// Producer 2: Publish the same task ID again immediately
 	// Use non-blocking Produce
@@ -383,7 +383,7 @@ func TestPublishDuplicateTaskCompleted(t *testing.T) {
 	assert.Empty(t, result1.Error, "First result should indicate success")
 
 	// Give Redis a moment to update state and publish
-	time.Sleep(50 * time.Millisecond)
+	// time.Sleep(50 * time.Millisecond)
 
 	// Producer 2: Publish the same task ID again
 	// This should return the cached result immediately
@@ -449,7 +449,7 @@ func TestPublishDuplicateTaskFailed(t *testing.T) {
 	assert.Contains(t, result1.Error, "simulated task processing failure", "First result should indicate failure")
 
 	// Give Redis a moment to update state and publish
-	time.Sleep(50 * time.Millisecond)
+	// time.Sleep(50 * time.Millisecond)
 
 	// Producer 2: Publish the same task ID again
 	// This should return the cached failure result immediately
@@ -553,7 +553,7 @@ func TestConsumerCancellation(t *testing.T) {
 	}()
 
 	// Give the consumer a moment to start
-	time.Sleep(100 * time.Millisecond)
+	// time.Sleep(100 * time.Millisecond)
 
 	// Cancel the consumer's context
 	cancelConsumer()
@@ -606,15 +606,15 @@ func TestTaskExpiryBeforeProcessing(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	config.TaskExpiry = 5 * time.Second
-	config.ProducerWaitTimeout = 3 * time.Second
+	config.TaskExpiry = 2 * time.Second
+	config.ProducerWaitTimeout = 1 * time.Second
 	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), config.TaskExpiry+5*time.Second) // Context longer than TaskExpiry
+	ctx, cancel := context.WithTimeout(context.Background(), config.TaskExpiry+2*time.Second) // Context longer than TaskExpiry
 	defer cancel()
 
 	taskID := "test-task-expiry-before-processing"
@@ -710,9 +710,6 @@ func TestRedisConnectionFailure(t *testing.T) {
 		shortLiveCtx, shortLiveCancel := context.WithTimeout(consumerCtx, 3*time.Second)
 		defer shortLiveCancel()
 		queue.Consume(shortLiveCtx, MockProcessTaskSuccess)
-		// If Consume exits due to context cancellation or internal error, we might not get here
-		// A more robust test would check logs or internal state.
-		// For this basic test, we rely on the Produce error and the fact Consume won't proceed.
 	}()
 
 	// Give the consumer a moment to try connecting/BRPOPing
@@ -758,7 +755,7 @@ func TestMultipleConsumers(t *testing.T) {
 	}
 
 	// Give consumers a moment to start
-	time.Sleep(100 * time.Millisecond)
+	// time.Sleep(100 * time.Millisecond)
 
 	numTasks := 20
 	taskIDs := make(map[string]struct{})
