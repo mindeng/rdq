@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 // MockProcessTaskSuccess simulates a successful task processing.
@@ -308,15 +309,27 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	require.Nil(t, nil, "First Produce call should not return an immediate result")
 	require.NotNil(t, resultCh1, "First Produce call should return a channel")
 
-	// Give the consumer a moment to pick up the task and start processing
-	// time.Sleep(50 * time.Millisecond)
-
 	// Producer 2: Publish the same task ID again immediately
 	// Use non-blocking Produce
 	_, resultCh2, err2 := queue.Produce(ctx, taskID, payload2) // Use payload2
 	require.NoError(t, err2, "Second Produce call should not return an immediate error")
 	require.Nil(t, nil, "Second Produce call should not return an immediate result")
 	require.NotNil(t, resultCh2, "Second Produce call should return a channel")
+
+	// Producer n
+	n := 10
+	g, gctx := errgroup.WithContext(ctx)
+	results := make(chan *Result, n)
+	for range n {
+		g.Go(func() error {
+			r, err := queue.ProduceBlock(gctx, taskID, payload2)
+			if err != nil {
+				return err
+			}
+			results <- r
+			return nil
+		})
+	}
 
 	// Assert that both channels are the same (or will deliver the same result)
 	// In this implementation, they wait for the same Pub/Sub channel.
@@ -342,6 +355,20 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	status, err := redisClient.Get(ctx, statusKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, taskStatusCompleted, status, "Task status in Redis should be completed")
+
+	g.Wait()
+	close(results)
+	for result := range results {
+		// Assert results from both producers are the same and successful
+		require.NotNil(t, result, "First producer should receive a result")
+		assert.Equal(t, result, result1, "Both producers should receive the same result")
+		assert.Empty(t, result.Error, "Result should indicate success")
+
+		var resultData map[string]string
+		err := json.Unmarshal(result.Data, &resultData)
+		require.NoError(t, err, "Failed to unmarshal result data")
+		assert.Equal(t, "Long task completed!", resultData["message"], "Result message should be from the long task")
+	}
 
 	cancelConsumer()
 	wg.Wait()
