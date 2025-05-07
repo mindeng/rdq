@@ -121,7 +121,7 @@ func TestPublishNilPayloadSuccess(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -172,7 +172,7 @@ func TestPublishNewTaskSuccess(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -229,7 +229,7 @@ func TestPublishNewTaskFailure(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -280,7 +280,7 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -355,7 +355,7 @@ func TestPublishDuplicateTaskCompleted(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -421,7 +421,7 @@ func TestPublishDuplicateTaskFailed(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -486,7 +486,7 @@ func TestProducerTimeout(t *testing.T) {
 	config.ProducerWaitTimeout = 1 * time.Second
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -538,7 +538,7 @@ func TestConsumerCancellation(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -610,7 +610,7 @@ func TestTaskExpiryBeforeProcessing(t *testing.T) {
 	config.ProducerWaitTimeout = 3 * time.Second
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -734,7 +734,7 @@ func TestMultipleConsumers(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -829,7 +829,7 @@ func TestProduceNonBlocking(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -891,7 +891,7 @@ func TestDefaultQueueName(t *testing.T) {
 	config := DefaultQueueConfig()
 	queue := NewQueue(redisClient, config)
 	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
+		err := cleanupKeysForQueue(redisClient, queue.Name())
 		require.NoError(t, err)
 	}()
 
@@ -971,6 +971,10 @@ func cleanupKeys(ctx context.Context, rc redis.UniversalClient, pattern string) 
 		keys, newCur, err := rc.Scan(ctx, cur, pattern, 0).Result()
 		if err != nil {
 			return err
+		}
+
+		if len(keys) == 0 {
+			break
 		}
 
 		_, err = rc.Del(ctx, keys...).Result()
