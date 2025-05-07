@@ -973,14 +973,13 @@ func cleanupKeys(ctx context.Context, rc redis.UniversalClient, pattern string) 
 			return err
 		}
 
-		if len(keys) == 0 {
-			break
+		if len(keys) > 0 {
+			_, err = rc.Del(ctx, keys...).Result()
+			if err != nil {
+				return err
+			}
 		}
 
-		_, err = rc.Del(ctx, keys...).Result()
-		if err != nil {
-			return err
-		}
 		if newCur == 0 {
 			break
 		}
