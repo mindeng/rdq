@@ -159,7 +159,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 	if setOk {
 		// Successfully set status to pending. This task is new or expired.
 		action = "queued"
-		// log.Printf("Task %s: Status set to pending. Storing payload and queueing.", taskID)
+		log.Printf("Task %s: Status set to pending. Storing payload and queueing.", taskID)
 
 		// --- Step 2: Store payload and push to queue ---
 		// These operations are not atomic with Step 1 in Redis Cluster,
@@ -179,7 +179,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 			// Return error immediately as queueing failed
 			return nil, nil, fmt.Errorf("failed to store payload or queue task %s: %w", taskID, execErr)
 		}
-		// log.Printf("Task %s: Payload stored and queued.", taskID)
+		log.Printf("Task %s: Payload stored and queued.", taskID)
 
 	} else {
 		// SETNX returned false, key already exists. Check current status.
@@ -191,7 +191,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 		switch status {
 		case taskStatusCompleted:
 			action = "completed"
-			// log.Printf("Task %s: Already completed, fetching result.", taskID)
+			log.Printf("Task %s: Already completed, fetching result.", taskID)
 			// Fetch result directly
 			resultData, getErr := q.redisClient.Get(ctx, resultKey).Bytes()
 			if getErr == redis.Nil {
@@ -214,7 +214,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 
 		case taskStatusFailed:
 			action = "failed"
-			// log.Printf("Task %s: Previously failed, fetching result.", taskID)
+			log.Printf("Task %s: Previously failed, fetching result.", taskID)
 			// Fetch result of the failed task
 			resultData, getErr := q.redisClient.Get(ctx, resultKey).Bytes()
 			if getErr == redis.Nil {
@@ -237,7 +237,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 
 		case taskStatusPending, taskStatusProcessing:
 			action = "waiting"
-			// log.Printf("Task %s: Already pending or processing, waiting for result.", taskID)
+			log.Printf("Task %s: Already pending or processing, waiting for result.", taskID)
 			// Fall through to waiting logic
 
 		case "": // Key did not exist (shouldn't happen if SETNX returned false, but defensive)
@@ -260,7 +260,7 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 			// Defer closing the channel to ensure it's closed when the goroutine exits.
 			defer close(resultCh)
 
-			// log.Printf("Task %s: Waiting for result via Pub/Sub on channel %s...", taskID, channelName)
+			log.Printf("Task %s: Waiting for result via Pub/Sub on channel %s...", taskID, channelName)
 			// Create a new context for the Pub/Sub subscription with a timeout
 			waitCtx, cancelWait := context.WithTimeout(ctx, q.config.ProducerWaitTimeout)
 			defer cancelWait()
@@ -286,8 +286,8 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 			msgCh := pubsub.Channel()
 
 			select {
-			case <-msgCh:
-				// log.Printf("Task %s: Received Pub/Sub message: %s", taskID, msg.Payload)
+			case msg := <-msgCh:
+				log.Printf("Task %s: Received Pub/Sub message: %s", taskID, msg.Payload)
 				// Message received, fetch result
 				resultData, getErr := q.redisClient.Get(ctx, resultKey).Bytes()
 				if getErr == redis.Nil {
@@ -435,7 +435,7 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 		}
 
 		action := consumeAction.(string)
-		// log.Printf("Task %s: Consume script returned action: %s", taskID, action)
+		log.Printf("Task %s: Consume script returned action: %s", taskID, action)
 
 		if action != "processing" {
 			log.Printf("Task %s: Not processing due to status '%s'. Skipping or potential retry needed.", taskID, action)
@@ -460,7 +460,7 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 		}
 
 		// Process the task
-		// log.Printf("Task %s: Executing processing logic...", taskID)
+		log.Printf("Task %s: Executing processing logic...", taskID)
 		// Pass the context to processFunc
 		resultData, processErr := processFunc(ctx, taskID, payloadData)
 
@@ -473,7 +473,7 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 			finalStatus = taskStatusFailed
 			taskResult = &Result{TaskID: taskID, Error: processErr.Error()}
 		} else {
-			// log.Printf("Task %s: Processing successful.", taskID)
+			log.Printf("Task %s: Processing successful.", taskID)
 			finalStatus = taskStatusCompleted
 			taskResult = &Result{TaskID: taskID, Data: json.RawMessage(resultData)}
 		}
@@ -519,7 +519,7 @@ func (q *Queue) updateStatusAndPublish(ctx context.Context, taskID string, statu
 		// without results. A separate monitoring process might be needed.
 		// We still attempt to publish the signal below, but the result might be missing.
 	} else {
-		// log.Printf("Task %s: Status updated to %s, result stored.", taskID, status)
+		log.Printf("Task %s: Status updated to %s, result stored.", taskID, status)
 	}
 
 	// Publish completion signal. Pub/Sub is a broadcast and doesn't rely on hash slots.
@@ -530,7 +530,7 @@ func (q *Queue) updateStatusAndPublish(ctx context.Context, taskID string, statu
 		log.Printf("Task %s: Failed to publish completion signal: %v", taskID, publishErr)
 		// Clients waiting for this task might time out.
 	} else {
-		// log.Printf("Task %s: Published completion signal.", taskID)
+		log.Printf("Task %s: Published completion signal.", taskID)
 	}
 }
 

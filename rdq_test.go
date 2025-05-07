@@ -18,11 +18,11 @@ import (
 
 // MockProcessTaskSuccess simulates a successful task processing.
 func MockProcessTaskSuccess(ctx context.Context, taskID string, payload []byte) ([]byte, error) {
-	log.Printf("MockProcessTaskSuccess: Processing Task %s", taskID)
+	// log.Printf("MockProcessTaskSuccess: Processing Task %s", taskID)
 	// Simulate work that respects context cancellation
 	select {
 	case <-ctx.Done():
-		log.Printf("MockProcessTaskSuccess: Task %s cancelled.", taskID)
+		// log.Printf("MockProcessTaskSuccess: Task %s cancelled.", taskID)
 		return nil, ctx.Err()
 	case <-time.After(100 * time.Millisecond): // Simulate quick work
 		// Continue processing
@@ -37,11 +37,11 @@ func MockProcessTaskSuccess(ctx context.Context, taskID string, payload []byte) 
 }
 
 func MockProcessTaskSuccessWithNilResult(ctx context.Context, taskID string, payload []byte) ([]byte, error) {
-	log.Printf("MockProcessTaskSuccess: Processing Task %s", taskID)
+	// log.Printf("MockProcessTaskSuccess: Processing Task %s", taskID)
 	// Simulate work that respects context cancellation
 	select {
 	case <-ctx.Done():
-		log.Printf("MockProcessTaskSuccess: Task %s cancelled.", taskID)
+		// log.Printf("MockProcessTaskSuccess: Task %s cancelled.", taskID)
 		return nil, ctx.Err()
 	case <-time.After(100 * time.Millisecond): // Simulate quick work
 		// Continue processing
@@ -52,10 +52,10 @@ func MockProcessTaskSuccessWithNilResult(ctx context.Context, taskID string, pay
 
 // MockProcessTaskFailure simulates a task processing failure.
 func MockProcessTaskFailure(ctx context.Context, taskID string, payload []byte) ([]byte, error) {
-	log.Printf("MockProcessTaskFailure: Processing Task %s", taskID)
+	// log.Printf("MockProcessTaskFailure: Processing Task %s", taskID)
 	select {
 	case <-ctx.Done():
-		log.Printf("MockProcessTaskFailure: Task %s cancelled.", taskID)
+		// log.Printf("MockProcessTaskFailure: Task %s cancelled.", taskID)
 		return nil, ctx.Err()
 	case <-time.After(100 * time.Millisecond): // Simulate quick work
 		// Continue processing
@@ -66,10 +66,10 @@ func MockProcessTaskFailure(ctx context.Context, taskID string, payload []byte) 
 
 // MockProcessTaskLong simulates a long-running task processing.
 func MockProcessTaskLong(ctx context.Context, taskID string, payload []byte) ([]byte, error) {
-	log.Printf("MockProcessTaskLong: Processing Task %s", taskID)
+	// log.Printf("MockProcessTaskLong: Processing Task %s", taskID)
 	select {
 	case <-ctx.Done():
-		log.Printf("MockProcessTaskLong: Task %s cancelled.", taskID)
+		// log.Printf("MockProcessTaskLong: Task %s cancelled.", taskID)
 		return nil, ctx.Err()
 	case <-time.After(3 * time.Second): // Simulate long work
 		// Continue processing
