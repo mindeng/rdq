@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -28,7 +29,7 @@ const (
 	keyQueue = "queue:tasks"
 
 	// Default prefix for internal Redis keys
-	defaultKeyPrefix = "_rdq:"
+	keyPrefix = "_rdq:"
 )
 
 // QueueConfig holds configuration options for the Queue.
@@ -44,8 +45,8 @@ type QueueConfig struct {
 	// A small non-zero timeout allows the consumer to check context cancellation periodically.
 	ConsumerBRPOPTimeout time.Duration
 
-	KeyPrefix string
-	Logger    *slog.Logger // Logger instance for this queue
+	Name   string
+	Logger *slog.Logger // Logger instance for this queue
 }
 
 // DefaultQueueConfig returns a QueueConfig with default values.
@@ -54,7 +55,7 @@ func DefaultQueueConfig() QueueConfig {
 		TaskExpiry:           5 * time.Minute,
 		ProducerWaitTimeout:  60 * time.Second,
 		ConsumerBRPOPTimeout: 1 * time.Second,
-		KeyPrefix:            defaultKeyPrefix,
+		Name:                 "",
 		Logger:               slog.New(slog.NewJSONHandler(os.Stdout, nil)), // Default logger
 	}
 }
@@ -77,9 +78,9 @@ func (qc QueueConfig) WithConsumerBRPOPTimeout(d time.Duration) QueueConfig {
 	return qc
 }
 
-// WithKeyPrefix sets the KeyPrefix string.
-func (qc QueueConfig) WithKeyPrefix(p string) QueueConfig {
-	qc.KeyPrefix = p
+// WithName sets the queue name.
+func (qc QueueConfig) WithName(p string) QueueConfig {
+	qc.Name = p
 	return qc
 }
 
@@ -110,11 +111,14 @@ type Queue struct {
 
 // NewQueue creates a new Queue instance.
 // If config.Logger is nil, a default slog.Logger will be used.
-func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
-	if config.KeyPrefix != "" && config.KeyPrefix[len(config.KeyPrefix)-1] != ':' {
-		config.KeyPrefix += ":"
-	} else if config.KeyPrefix == "" {
-		config.KeyPrefix = defaultKeyPrefix
+func NewQueue(client redis.UniversalClient, config QueueConfig) (*Queue, error) {
+	if config.Name == "" {
+		config.Name = uuid.NewString()
+	} else {
+		// Check if the queue name exists
+		if _, err := client.Exists(context.Background(), config.getKey(keyQueue)).Result(); err != redis.Nil {
+			return nil, fmt.Errorf("queue name exists: %s", config.Name)
+		}
 	}
 
 	// Ensure logger is initialized
@@ -122,14 +126,27 @@ func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
 		config.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)) // Default if not provided
 	}
 
-	return &Queue{
+	q := &Queue{
 		redisClient: client,
 		config:      config,
 	}
+	return q, nil
+}
+
+func (q *Queue) Config() *QueueConfig {
+	return &q.config
+}
+
+func (q *Queue) Name() string {
+	return q.config.Name
 }
 
 func (q *Queue) getKey(format string, args ...interface{}) string {
-	prefixedFormat := q.config.KeyPrefix + format
+	return q.config.getKey(format, args...)
+}
+
+func (c *QueueConfig) getKey(format string, args ...interface{}) string {
+	prefixedFormat := keyPrefix + ":" + c.Name + ":" + format
 	return fmt.Sprintf(prefixedFormat, args...)
 }
 

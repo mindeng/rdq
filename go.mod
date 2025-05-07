@@ -3,6 +3,7 @@ module github.com/mindeng/rdq
 go 1.24.2
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.8.0
 	github.com/stretchr/testify v1.10.0
 )
