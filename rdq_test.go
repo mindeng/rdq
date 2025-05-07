@@ -484,7 +484,7 @@ func TestProducerTimeout(t *testing.T) {
 
 	// ProduceBlock should return an error due to the timeout
 	require.Error(t, err, "ProduceBlock should return an error due to timeout")
-	assert.Contains(t, err.Error(), "wait for result timed out after", "Error message should indicate waiting timeout")
+	assert.Contains(t, err.Error(), "wait for stream message timed out after", "Error message should indicate waiting timeout")
 	assert.Contains(t, err.Error(), config.ProducerWaitTimeout.String(), "Error message should contain the configured timeout duration")
 	// assert.Nil(t, result, "ProduceBlock should return a nil result on timeout")
 
@@ -975,7 +975,7 @@ func shutdown() {
 		panic(err)
 	}
 	cleanupKeys(context.Background(), rdb, testQueueConfig.KeyPrefix+"*")
-	cleanupKeys(context.Background(), rdb, fmt.Sprintf("_rdq:task:{%s*}*", testTaskIDPrefix))
+	cleanupKeys(context.Background(), rdb, fmt.Sprintf("_rdq:*:{%s*}*", testTaskIDPrefix))
 }
 
 func getTestQueueConfig() QueueConfig {
