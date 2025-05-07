@@ -99,6 +99,59 @@ func getRedisClient() (*redis.Client, string, error) {
 	return rdb, redisAddr, err
 }
 
+// TestPublishNilPayloadSuccess tests publishing a new task with nil payload that succeeds.
+func TestPublishNilPayloadSuccess(t *testing.T) {
+	redisClient := setupTestRedisClient(t)
+	defer redisClient.Close()
+	// Use default config for the test
+	config := getTestQueueConfig()
+	queue := NewQueue(redisClient, config)
+
+	// Use a context for the test
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Start a consumer in a goroutine
+	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
+	defer cancelConsumer()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		queue.Consume(consumerCtx, MockProcessTaskSuccess)
+	}()
+
+	taskID := "test-task-nil-payload-1"
+	var payload []byte = nil
+
+	// Publish the task and block for the result
+	result, err := queue.ProduceBlock(ctx, taskID, payload)
+
+	// Assert no error from ProduceBlock
+	require.NoError(t, err, "ProduceBlock should not return an error for a successful task")
+	require.NotNil(t, result, "ProduceBlock should return a non-nil result")
+
+	// Assert the result details
+	assert.Equal(t, taskID, result.TaskID, "Result TaskID should match the published task ID")
+	assert.Empty(t, result.Error, "Result Error field should be empty for success")
+
+	var resultData map[string]string
+	err = json.Unmarshal(result.Data, &resultData)
+	require.NoError(t, err, "Failed to unmarshal result data")
+	assert.Equal(t, "processed", resultData["status"], "Result data status should be 'processed'")
+	assert.Equal(t, "Task completed successfully!", resultData["message"], "Result data message should be success message")
+
+	// Verify status in Redis (optional, but good for confidence)
+	statusKey := queue.getKey(keyStatus, taskID) // Use queue.getKey
+	status, err := redisClient.Get(ctx, statusKey).Result()
+	require.NoError(t, err)
+	assert.Equal(t, taskStatusCompleted, status, "Task status in Redis should be completed")
+
+	// Clean up the consumer goroutine
+	cancelConsumer()
+	wg.Wait()
+}
+
 // TestPublishNewTaskSuccess tests publishing a new task that succeeds.
 func TestPublishNewTaskSuccess(t *testing.T) {
 	redisClient := setupTestRedisClient(t)
