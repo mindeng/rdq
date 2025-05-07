@@ -111,14 +111,9 @@ type Queue struct {
 
 // NewQueue creates a new Queue instance.
 // If config.Logger is nil, a default slog.Logger will be used.
-func NewQueue(client redis.UniversalClient, config QueueConfig) (*Queue, error) {
+func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
 	if config.Name == "" {
 		config.Name = uuid.NewString()
-	} else {
-		// Check if the queue name exists
-		if _, err := client.Exists(context.Background(), config.getKey(keyQueue)).Result(); err != redis.Nil {
-			return nil, fmt.Errorf("queue name exists: %s", config.Name)
-		}
 	}
 
 	// Ensure logger is initialized
@@ -130,11 +125,11 @@ func NewQueue(client redis.UniversalClient, config QueueConfig) (*Queue, error) 
 		redisClient: client,
 		config:      config,
 	}
-	return q, nil
+	return q
 }
 
-func (q *Queue) Config() *QueueConfig {
-	return &q.config
+func (q *Queue) Config() QueueConfig {
+	return q.config
 }
 
 func (q *Queue) Name() string {
@@ -146,7 +141,7 @@ func (q *Queue) getKey(format string, args ...interface{}) string {
 }
 
 func (c *QueueConfig) getKey(format string, args ...interface{}) string {
-	prefixedFormat := keyPrefix + ":" + c.Name + ":" + format
+	prefixedFormat := keyPrefix + c.Name + ":" + format
 	return fmt.Sprintf(prefixedFormat, args...)
 }
 

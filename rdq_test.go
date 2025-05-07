@@ -119,8 +119,7 @@ func TestPublishNilPayloadSuccess(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -171,8 +170,7 @@ func TestPublishNewTaskSuccess(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -229,8 +227,7 @@ func TestPublishNewTaskFailure(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -281,8 +278,7 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -337,7 +333,7 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	assert.Empty(t, result1.Error, "Result should indicate success")
 
 	var resultData map[string]string
-	err = json.Unmarshal(result1.Data, &resultData)
+	err := json.Unmarshal(result1.Data, &resultData)
 	require.NoError(t, err, "Failed to unmarshal result data")
 	assert.Equal(t, "Long task completed!", resultData["message"], "Result message should be from the long task")
 
@@ -357,8 +353,7 @@ func TestPublishDuplicateTaskCompleted(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -424,8 +419,7 @@ func TestPublishDuplicateTaskFailed(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -490,8 +484,7 @@ func TestProducerTimeout(t *testing.T) {
 	// Use default config, but override ProducerWaitTimeout
 	config := DefaultQueueConfig()
 	config.ProducerWaitTimeout = 1 * time.Second
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -515,7 +508,7 @@ func TestProducerTimeout(t *testing.T) {
 	payload := []byte(`{"data": "timeout test"}`)
 
 	// Publish the task and block for the result with the configured short timeout
-	_, err = queue.ProduceBlock(ctx, taskID, payload)
+	_, err := queue.ProduceBlock(ctx, taskID, payload)
 
 	// ProduceBlock should return an error due to the timeout
 	require.Error(t, err, "ProduceBlock should return an error due to timeout")
@@ -543,8 +536,7 @@ func TestConsumerCancellation(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -616,8 +608,7 @@ func TestTaskExpiryBeforeProcessing(t *testing.T) {
 	config := DefaultQueueConfig()
 	config.TaskExpiry = 5 * time.Second
 	config.ProducerWaitTimeout = 3 * time.Second
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -640,7 +631,7 @@ func TestTaskExpiryBeforeProcessing(t *testing.T) {
 
 	// Verify the status key has expired
 	statusKey := queue.getKey(keyStatus, taskID) // Use queue.getKey
-	_, err = redisClient.Get(ctx, statusKey).Result()
+	_, err := redisClient.Get(ctx, statusKey).Result()
 	assert.Equal(t, redis.Nil, err, "Status key should have expired")
 
 	// Publish the same task ID again
@@ -692,8 +683,7 @@ func TestRedisConnectionFailure(t *testing.T) {
 	})
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(rdb, config)
-	require.NoError(t, err)
+	queue := NewQueue(rdb, config)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -702,7 +692,7 @@ func TestRedisConnectionFailure(t *testing.T) {
 	payload := []byte(`{"data": "should fail"}`)
 
 	// Attempt to produce a task
-	_, _, err = queue.Produce(ctx, taskID, payload)
+	_, _, err := queue.Produce(ctx, taskID, payload)
 
 	// Expect an error related to connection failure
 	require.Error(t, err, "Produce should return an error when Redis is unreachable")
@@ -742,8 +732,7 @@ func TestMultipleConsumers(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -838,8 +827,7 @@ func TestProduceNonBlocking(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -901,8 +889,7 @@ func TestDefaultQueueName(t *testing.T) {
 	defer redisClient.Close()
 
 	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
+	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, config.Name)
 		require.NoError(t, err)
@@ -951,47 +938,6 @@ func TestDefaultQueueName(t *testing.T) {
 	wg.Wait()
 }
 
-func TestConflictQueueName(t *testing.T) {
-	redisClient := setupTestRedisClient(t)
-	defer redisClient.Close()
-
-	config := DefaultQueueConfig()
-	queue, err := NewQueue(redisClient, config)
-	require.NoError(t, err)
-	defer func() {
-		err := cleanupKeysForQueue(redisClient, config.Name)
-		require.NoError(t, err)
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
-	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		queue.Consume(consumerCtx, MockProcessTaskSuccess)
-	}()
-
-	taskID := "test-conflict-name-task"
-	payload := []byte(`{"data": "conflict name test"}`)
-
-	result, err := queue.ProduceBlock(ctx, taskID, payload)
-	require.NoError(t, err, "ProduceBlock should succeed with conflict queue name")
-	require.NotNil(t, result, "ProduceBlock should return a result")
-	assert.Empty(t, result.Error, "Result Error field should be empty for success")
-	assert.Equal(t, taskID, result.TaskID, "Result TaskID should match")
-
-	config2 := DefaultQueueConfig().WithName(queue.Name())
-	_, err = NewQueue(redisClient, config2)
-	require.Error(t, err)
-
-	cancelConsumer()
-	wg.Wait()
-}
-
 func TestMain(m *testing.M) {
 	setup()
 	code := m.Run()
@@ -1013,10 +959,6 @@ func shutdown() {
 		panic(err)
 	}
 	cleanupKeys(context.Background(), rdb, "_rdq:"+testQueueConfig.Name+":*")
-}
-
-func getTestQueueConfig() QueueConfig {
-	return testQueueConfig
 }
 
 func cleanupKeysForQueue(rc redis.UniversalClient, name string) error {
