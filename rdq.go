@@ -467,7 +467,17 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 		}
 
 		logger.Info("Executing processing logic for task...", "taskID", taskID)
-		resultData, processErr := processFunc(ctx, taskID, payloadData)
+		var resultData []byte
+		var processErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Panic occurred, marking failed", "panic", r, "taskID", taskID)
+					processErr = fmt.Errorf("processFunc panic: %v", r)
+				}
+			}()
+			resultData, processErr = processFunc(ctx, taskID, payloadData)
+		}()
 
 		var finalStatus string
 		var taskResult *Result
