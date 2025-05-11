@@ -415,8 +415,9 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 				logger.Info("Consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
 				return
 			}
-			logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
-			time.Sleep(5 * time.Second)
+			logger.Warn("BRPOP error, continue trying.", "queueKey", queueKey, "err", err)
+			// logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
+			// time.Sleep(5 * time.Second)
 			continue
 		}
 
