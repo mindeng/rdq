@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,33 +22,56 @@ const (
 	taskStatusCompleted  = "completed"
 	taskStatusFailed     = "failed"
 
-	keyStatus             = "task:{%s}:status"
-	keyPayload            = "task:{%s}:payload"
-	keyResult             = "task:{%s}:result"
-	keyStreamResultFormat = "stream:task:{%s}:results"
+	// Keys for task-specific metadata and results
+	keyStatus             = "task:{%s}:status"         // Stores the processing status of a specific taskID
+	keyResult             = "task:{%s}:result"         // Stores the execution result of a specific taskID
+	keyStreamResultFormat = "stream:task:{%s}:results" // Stream for publishing results of a specific taskID
 
-	keyQueue = "queue:tasks"
+	// Suffix for the main task stream (one stream per queue instance)
+	keyTaskStreamSuffix = "tasks_stream"
+	// Suffix for the consumer group name associated with the task stream
+	defaultConsumerGroupNameSuffix = "group"
 
-	// Default prefix for internal Redis keys
+	// Default prefix for all internal Redis keys
 	keyPrefix = "_rdq:"
+
+	// Fields within a task stream message
+	taskStreamMessageFieldTaskID  = "taskID"
+	taskStreamMessageFieldPayload = "payload"
 )
 
 // QueueConfig holds configuration options for the Queue.
 type QueueConfig struct {
-	// TaskExpiry is the time after which task status, payload, result, and stream keys expire.
-	// Should be long enough to cover max processing time + waiting time.
+	// TaskExpiry is the time after which task status, and result keys/streams expire.
 	TaskExpiry time.Duration
 
-	Name   string
-	Logger *slog.Logger // Logger instance for this queue
+	// ProducerResultWaitTimeout is the maximum time a producer will wait for a task result via the result Stream.
+	// This is used to create a context.WithTimeout for the producer's wait.
+	ProducerResultWaitTimeout time.Duration
+
+	// Name is the base name for this queue, used to prefix Redis keys.
+	Name string
+	// Logger is the slog.Logger instance for this queue.
+	Logger *slog.Logger
+
+	// ConsumerGroupName is the name of the consumer group for the task stream.
+	// All consumers for this queue should share the same group name.
+	ConsumerGroupName string
+
+	// ConsumerIdentifier is a unique identifier for this specific consumer instance.
+	// Crucial for XREADGROUP's Pending Entries List (PEL) management.
+	ConsumerIdentifier string
 }
 
 // DefaultQueueConfig returns a QueueConfig with default values.
 func DefaultQueueConfig() QueueConfig {
 	return QueueConfig{
-		TaskExpiry: 5 * time.Minute,
-		Name:       "",
-		Logger:     slog.New(slog.NewJSONHandler(os.Stdout, nil)), // Default logger
+		TaskExpiry:                5 * time.Minute,
+		ProducerResultWaitTimeout: 60 * time.Second,
+		Name:                      "", // Will be defaulted to a UUID if empty
+		Logger:                    slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		ConsumerGroupName:         "", // Will be defaulted based on queue name
+		ConsumerIdentifier:        "", // Will be defaulted to a UUID if empty
 	}
 }
 
@@ -57,9 +81,15 @@ func (qc QueueConfig) WithTaskExpiry(d time.Duration) QueueConfig {
 	return qc
 }
 
+// WithProducerResultWaitTimeout sets the ProducerResultWaitTimeout duration.
+func (qc QueueConfig) WithProducerResultWaitTimeout(d time.Duration) QueueConfig {
+	qc.ProducerResultWaitTimeout = d
+	return qc
+}
+
 // WithName sets the queue name.
-func (qc QueueConfig) WithName(p string) QueueConfig {
-	qc.Name = p
+func (qc QueueConfig) WithName(name string) QueueConfig {
+	qc.Name = name
 	return qc
 }
 
@@ -69,7 +99,19 @@ func (qc QueueConfig) WithLogger(l *slog.Logger) QueueConfig {
 	return qc
 }
 
-// Task represents a task payload.
+// WithConsumerGroupName sets the consumer group name.
+func (qc QueueConfig) WithConsumerGroupName(groupName string) QueueConfig {
+	qc.ConsumerGroupName = groupName
+	return qc
+}
+
+// WithConsumerIdentifier sets the unique consumer identifier.
+func (qc QueueConfig) WithConsumerIdentifier(id string) QueueConfig {
+	qc.ConsumerIdentifier = id
+	return qc
+}
+
+// Task represents a task payload (used by producer).
 type Task struct {
 	ID      string          `json:"id"`
 	Payload json.RawMessage `json:"payload"`
@@ -79,215 +121,240 @@ type Task struct {
 type Result struct {
 	TaskID string          `json:"task_id"`
 	Data   json.RawMessage `json:"data,omitempty"`
-	Error  string          `json:"error,omitempty"` // Use Error field to signal processing/fetch error
+	Error  string          `json:"error,omitempty"`
 }
 
 // Queue represents the message queue.
 type Queue struct {
-	redisClient redis.UniversalClient
-	config      QueueConfig // Holds configuration including the logger
+	redisClient   redis.UniversalClient
+	config        QueueConfig
+	taskStreamKey string // Cache the computed task stream key
 }
 
 // NewQueue creates a new Queue instance.
-// If config.Logger is nil, a default slog.Logger will be used.
 func NewQueue(client redis.UniversalClient, config QueueConfig) *Queue {
 	if config.Name == "" {
 		config.Name = uuid.NewString()
+		if config.Logger != nil {
+			config.Logger.Info("Queue name not provided, defaulted to UUID", "queueName", config.Name)
+		}
 	}
 
-	// Ensure logger is initialized
 	if config.Logger == nil {
-		config.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)) // Default if not provided
+		config.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	}
+
+	if config.ConsumerGroupName == "" {
+		config.ConsumerGroupName = config.Name + ":" + defaultConsumerGroupNameSuffix
+		config.Logger.Info("ConsumerGroupName not provided, defaulted", "consumerGroupName", config.ConsumerGroupName)
+	}
+	if config.ConsumerIdentifier == "" {
+		config.ConsumerIdentifier = uuid.NewString()
+		config.Logger.Info("ConsumerIdentifier not provided, defaulted to UUID", "consumerIdentifier", config.ConsumerIdentifier)
 	}
 
 	q := &Queue{
 		redisClient: client,
 		config:      config,
 	}
+	q.taskStreamKey = q.getKey(keyTaskStreamSuffix)
+
+	err := q.redisClient.XGroupCreateMkStream(context.Background(), q.taskStreamKey, q.config.ConsumerGroupName, "0").Err()
+	if err != nil {
+		if !strings.Contains(err.Error(), "BUSYGROUP") {
+			q.config.Logger.Error("Failed to create consumer group for task stream (and error is not BUSYGROUP)",
+				"stream", q.taskStreamKey, "group", q.config.ConsumerGroupName, "err", err)
+		} else {
+			q.config.Logger.Info("Consumer group already exists or was successfully created",
+				"stream", q.taskStreamKey, "group", q.config.ConsumerGroupName)
+		}
+	} else {
+		q.config.Logger.Info("Successfully created consumer group for task stream",
+			"stream", q.taskStreamKey, "group", q.config.ConsumerGroupName)
+	}
 	return q
 }
 
+// Config returns the queue's configuration.
 func (q *Queue) Config() QueueConfig {
 	return q.config
 }
 
+// Name returns the base name of the queue.
 func (q *Queue) Name() string {
 	return q.config.Name
 }
 
+// getKey constructs a Redis key.
 func (q *Queue) getKey(format string, args ...interface{}) string {
-	return q.config.getKey(format, args...)
+	return fmt.Sprintf(keyPrefix+q.config.Name+":"+format, args...)
 }
 
-func (c *QueueConfig) getKey(format string, args ...interface{}) string {
-	prefixedFormat := keyPrefix + c.Name + ":" + format
-	return fmt.Sprintf(prefixedFormat, args...)
-}
-
-// KEYS: [status_key]
-// ARGV: [task_id, old_status, new_status, expiry_seconds, processing_status, completed_status]
+// consumeScript is a Lua script to atomically check and update task status.
 var consumeScript = redis.NewScript(`
 local status_key = KEYS[1]
-local task_id = ARGV[1]
-local old_status = ARGV[2]
-local new_status = ARGV[3]
+local old_status = ARGV[1] -- Note: ARGV[1] in script corresponds to taskID in Go, but script uses it as old_status for clarity if taskID was ARGV[0]
+-- Corrected ARGV mapping based on Go code:
+-- ARGV[1] = taskID (for logging/internal use, not key construction)
+-- ARGV[2] = old_status (e.g. "pending")
+-- ARGV[3] = new_status (e.g. "processing")
+-- ARGV[4] = expiry_seconds
+-- ARGV[5] = processing_status_check (e.g. "processing", for "already_done_or_processing_by_other")
+-- ARGV[6] = completed_status_check (e.g. "completed", for "already_done_or_processing_by_other")
+
+local expected_old_status = ARGV[2]
+local new_processing_status = ARGV[3]
 local expiry = tonumber(ARGV[4])
-local processing_status = ARGV[5]
-local completed_status = ARGV[6]
+local check_processing_status = ARGV[5]
+local check_completed_status = ARGV[6]
+-- local task_id_arg = ARGV[1] -- available if needed
 
 local current_status = redis.call('GET', status_key)
 
-if current_status == old_status then
-    -- Status is as expected, transition to new status
-    -- Use XX to ensure the key exists (prevents setting if it expired between GET and SET)
-    local set_ok = redis.call('SET', status_key, new_status, 'EX', expiry, 'XX')
+if current_status == expected_old_status then
+    local set_ok = redis.call('SET', status_key, new_processing_status, 'EX', expiry, 'XX')
     if set_ok then
         return 'processing'
     else
-        -- Should not happen if GET returned old_status and key didn't expire immediately after
-        -- but indicates a race condition or quick expiry.
-        return 'race'
+        return 'race_or_expired'
     end
-elseif current_status == processing_status or current_status == completed_status then
-    -- Check if already processing or completed by another consumer/retry
-    return 'already_done'
+elseif current_status == new_processing_status then
+    return 'already_processing_by_self_or_claimed'
+elseif current_status == check_processing_status or current_status == check_completed_status or current_status == taskStatusFailed then -- taskStatusFailed is a global constant
+    return 'already_done_or_processing_by_other'
 else
-    -- Status is not the expected old_status (e.g., failed, expired, not found)
-    return 'invalid_status'
+    if current_status == false then
+        return 'expired_or_missing'
+    end
+    return 'invalid_status_unexpected'
 end
 `)
 
 // Produce adds a task to the queue.
-// If the result is immediately available (task already completed/failed), it returns the result directly.
-// Otherwise, it returns a channel that will deliver the result or an error later.
-// Returns (immediateResult *Result, resultChannel <-chan *Result, err error).
 func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Result, <-chan *Result, error) {
-	logger := q.config.Logger // Use logger from config
-	payloadJSON, err := json.Marshal(json.RawMessage(payload))
-	if err != nil {
-		logger.Error("Failed to marshal payload", "taskID", taskID, "err", err)
-		return nil, nil, fmt.Errorf("failed to marshal payload: %w", err)
-	}
+	logger := q.config.Logger
+	payloadJSON := json.RawMessage(payload)
 
 	statusKey := q.getKey(keyStatus, taskID)
-	payloadKey := q.getKey(keyPayload, taskID)
 	resultKey := q.getKey(keyResult, taskID)
-	queueKey := q.getKey(keyQueue)
 
 	setOk, err := q.redisClient.SetNX(ctx, statusKey, taskStatusPending, q.config.TaskExpiry).Result()
 	if err != nil {
-		logger.Error("Redis SETNX error for task", "taskID", taskID, "key", statusKey, "err", err)
+		logger.Error("Redis SETNX error for task status", "taskID", taskID, "statusKey", statusKey, "err", err)
 		return nil, nil, fmt.Errorf("redis SETNX error for task %s: %w", taskID, err)
 	}
 
 	var action string
 	if setOk {
-		action = "queued"
-		logger.Info("Task status set to pending. Storing payload and queueing.", "taskID", taskID)
-
-		pipe := q.redisClient.Pipeline()
-		pipe.Set(ctx, payloadKey, payloadJSON, q.config.TaskExpiry)
-		pipe.LPush(ctx, queueKey, taskID)
-		_, execErr := pipe.Exec(ctx)
-		if execErr != nil {
-			logger.Error("CRITICAL - Failed to store payload or queue after setting pending", "taskID", taskID, "err", execErr)
-			q.redisClient.Set(ctx, statusKey, taskStatusFailed, q.config.TaskExpiry) // Best effort
-			return nil, nil, fmt.Errorf("failed to store payload or queue task %s: %w", taskID, execErr)
+		action = "queued_to_stream"
+		logger.Info("Task status set to pending via SETNX. Adding task to stream.", "taskID", taskID)
+		_, xaddErr := q.redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: q.taskStreamKey,
+			Values: map[string]interface{}{
+				taskStreamMessageFieldTaskID:  taskID,
+				taskStreamMessageFieldPayload: string(payloadJSON),
+			},
+		}).Result()
+		if xaddErr != nil {
+			logger.Error("CRITICAL - Failed to XADD task to stream after setting status to pending", "taskID", taskID, "stream", q.taskStreamKey, "err", xaddErr)
+			q.redisClient.Set(ctx, statusKey, taskStatusFailed, q.config.TaskExpiry)
+			return nil, nil, fmt.Errorf("failed to XADD task %s to stream: %w", taskID, xaddErr)
 		}
-		logger.Info("Payload stored and task queued.", "taskID", taskID)
+		logger.Info("Task added to stream.", "taskID", taskID, "stream", q.taskStreamKey)
 	} else {
-		status, getErr := q.redisClient.Get(ctx, statusKey).Result()
-		if getErr != nil && getErr != redis.Nil {
-			logger.Error("Failed to get status for existing task", "taskID", taskID, "key", statusKey, "err", getErr)
+		currentStatus, getErr := q.redisClient.Get(ctx, statusKey).Result()
+		if getErr != nil && !errors.Is(getErr, redis.Nil) {
+			logger.Error("Failed to GET status for existing task after SETNX failed", "taskID", taskID, "statusKey", statusKey, "err", getErr)
 			return nil, nil, fmt.Errorf("failed to get status for existing task %s: %w", taskID, getErr)
 		}
-
-		switch status {
-		case taskStatusCompleted, taskStatusFailed:
-			action = "completed_or_failed"
-			logger.Info("Task already completed or failed, fetching result directly.", "taskID", taskID, "status", status)
-			resultData, getResErr := q.redisClient.Get(ctx, resultKey).Bytes()
-			if getResErr == redis.Nil {
-				logger.Warn("Task status is completed/failed, but result not found (likely expired or inconsistent)", "taskID", taskID, "status", status, "resultKey", resultKey)
-				return nil, nil, fmt.Errorf("task %s status is %s, but result not found (likely expired or inconsistent)", taskID, status)
-			} else if getResErr != nil {
-				logger.Error("Failed to get result for completed/failed task", "taskID", taskID, "status", status, "resultKey", resultKey, "err", getResErr)
-				return nil, nil, fmt.Errorf("failed to get result for task %s (%s): %w", taskID, status, getResErr)
+		if errors.Is(getErr, redis.Nil) {
+			logger.Warn("Task status key expired between SETNX and GET. Treating as if task needs queuing for result listening.", "taskID", taskID)
+			action = "waiting_for_result_stream"
+		} else {
+			switch currentStatus {
+			case taskStatusCompleted, taskStatusFailed:
+				action = "completed_or_failed_direct_result"
+				logger.Info("Task already completed or failed, fetching result directly.", "taskID", taskID, "currentStatus", currentStatus)
+				resultData, getResErr := q.redisClient.Get(ctx, resultKey).Bytes()
+				if errors.Is(getResErr, redis.Nil) {
+					logger.Warn("Task status is completed/failed, but result data not found (likely expired).", "taskID", taskID, "currentStatus", currentStatus, "resultKey", resultKey)
+					return &Result{TaskID: taskID, Error: fmt.Sprintf("task %s is %s, but result data expired", taskID, currentStatus)}, nil, nil
+				} else if getResErr != nil {
+					logger.Error("Failed to get result data for task", "taskID", taskID, "currentStatus", currentStatus, "resultKey", resultKey, "err", getResErr)
+					return nil, nil, fmt.Errorf("failed to get result for task %s (%s): %w", taskID, currentStatus, getResErr)
+				}
+				var res Result
+				if umErr := json.Unmarshal(resultData, &res); umErr != nil {
+					logger.Warn("Failed to unmarshal direct result data for task", "taskID", taskID, "err", umErr)
+					res.TaskID = taskID
+					res.Error = fmt.Sprintf("failed to unmarshal direct result: %v", umErr)
+				}
+				return &res, nil, nil
+			case taskStatusPending, taskStatusProcessing:
+				action = "waiting_for_result_stream"
+				logger.Info("Task already pending or processing, producer will wait for result via result stream.", "taskID", taskID, "currentStatus", currentStatus)
+			default:
+				logger.Warn("Unexpected task status found. Producer will wait for result via result stream.", "taskID", taskID, "currentStatus", currentStatus)
+				action = "waiting_for_result_stream"
 			}
-
-			var result Result
-			if umErr := json.Unmarshal(resultData, &result); umErr != nil {
-				logger.Warn("Failed to unmarshal direct result for task", "taskID", taskID, "err", umErr)
-				result.TaskID = taskID
-				result.Error = fmt.Sprintf("failed to unmarshal direct result: %v", umErr)
-			}
-			return &result, nil, nil
-
-		case taskStatusPending, taskStatusProcessing:
-			action = "waiting"
-			logger.Info("Task already pending or processing, waiting for result via stream.", "taskID", taskID, "status", status)
-		case "":
-			logger.Warn("Status key did not exist after SETNX returned false. Race condition? Treating as waiting.", "taskID", taskID, "statusKey", statusKey)
-			action = "waiting"
-		default:
-			logger.Warn("Unexpected task status. Treating as waiting.", "taskID", taskID, "status", status)
-			action = "waiting"
 		}
 	}
 
-	if action == "queued" || action == "waiting" {
+	if action == "queued_to_stream" || action == "waiting_for_result_stream" {
 		resultCh := make(chan *Result, 1)
-		streamKey := q.getKey(keyStreamResultFormat, taskID)
+		resultStreamKey := q.getKey(keyStreamResultFormat, taskID)
 
 		go func() {
-			// Use the logger from the Queue instance within the goroutine
-			goroutineLogger := q.config.Logger
+			goroutineLogger := q.config.Logger.With("goroutine", "producerResultListener", "taskID", taskID)
 			defer close(resultCh)
 
-			goroutineLogger.Info("Attempting to fetch existing result or wait on stream", "taskID", taskID, "streamKey", streamKey)
+			waitResultCtx, cancelWaitResult := context.WithTimeout(ctx, q.config.ProducerResultWaitTimeout)
+			defer cancelWaitResult()
 
-			existingMsgs, revRangeErr := q.redisClient.XRevRangeN(ctx, streamKey, "+", "-", 1).Result()
+			goroutineLogger.Info("Attempting to fetch existing result or wait on result stream", "resultStreamKey", resultStreamKey)
+
+			existingMsgs, revRangeErr := q.redisClient.XRevRangeN(waitResultCtx, resultStreamKey, "+", "-", 1).Result()
 			if revRangeErr == nil && len(existingMsgs) == 1 {
 				msg := existingMsgs[0]
 				var res Result
 				if val, ok := msg.Values["result"].(string); ok {
 					if umErr := json.Unmarshal([]byte(val), &res); umErr == nil {
-						goroutineLogger.Info("Fetched existing result from stream via XRevRange", "taskID", taskID, "streamMessageID", msg.ID)
+						goroutineLogger.Info("Fetched existing result from result stream via XRevRange", "messageID", msg.ID)
 						resultCh <- &res
 						return
 					} else {
-						goroutineLogger.Warn("Failed to unmarshal existing stream result from XRevRange. Will proceed to XREAD.", "taskID", taskID, "streamMessageID", msg.ID, "err", umErr)
+						goroutineLogger.Warn("Failed to unmarshal existing result stream message. Will proceed to XREAD.", "messageID", msg.ID, "err", umErr)
 					}
 				} else {
-					goroutineLogger.Warn("Existing stream message 'result' field not a string (XRevRange). Will proceed to XREAD.", "taskID", taskID, "streamMessageID", msg.ID)
+					goroutineLogger.Warn("Existing result stream message 'result' field not a string. Will proceed to XREAD.", "messageID", msg.ID)
 				}
-			} else if revRangeErr != nil && revRangeErr != redis.Nil {
-				goroutineLogger.Error("Error checking existing stream result (XRevRange)", "taskID", taskID, "streamKey", streamKey, "err", revRangeErr)
-				resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("error checking existing stream result: %v", revRangeErr)}
+			} else if revRangeErr != nil && !errors.Is(revRangeErr, redis.Nil) {
+				goroutineLogger.Error("Error checking existing result stream (XRevRange)", "err", revRangeErr)
+				resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("error checking existing result stream: %v", revRangeErr)}
 				return
 			}
 
-			goroutineLogger.Info("No valid immediate result from XRevRange, proceeding to XREAD.", "taskID", taskID, "streamKey", streamKey)
+			goroutineLogger.Info("No valid immediate result from result stream XRevRange, proceeding to XREAD.", "timeout", q.config.ProducerResultWaitTimeout)
 			xreadStartID := "0-0"
 			xreadArgs := &redis.XReadArgs{
-				Streams: []string{streamKey, xreadStartID},
+				Streams: []string{resultStreamKey, xreadStartID},
 				Count:   1,
-				Block:   0,
+				Block:   0, // Rely on waitResultCtx for timeout
 			}
 
-			cmdResult, readErr := q.redisClient.XRead(ctx, xreadArgs).Result()
+			cmdResult, readErr := q.redisClient.XRead(waitResultCtx, xreadArgs).Result()
 			if readErr != nil {
-				errMsg := "wait for stream message timed out"
-				if errors.Is(readErr, context.DeadlineExceeded) || (ctx.Err() == context.DeadlineExceeded) {
-					goroutineLogger.Warn("Wait for stream message timed out (context deadline)", "taskID", taskID, "streamKey", streamKey, "err", readErr)
-				} else if errors.Is(readErr, redis.Nil) {
-					goroutineLogger.Warn("Wait for stream message timed out (XRead redis.Nil)", "taskID", taskID, "streamKey", streamKey)
+				errMsg := fmt.Sprintf("wait for result stream message timed out after %v", q.config.ProducerResultWaitTimeout)
+				if errors.Is(readErr, context.DeadlineExceeded) || errors.Is(waitResultCtx.Err(), context.DeadlineExceeded) {
+					goroutineLogger.Warn("Wait for result stream message timed out (context deadline)", "err", readErr)
+				} else if errors.Is(readErr, redis.Nil) { // Should be less common with Block:0 if ctx timeout is shorter
+					goroutineLogger.Warn("Wait for result stream message timed out (XRead redis.Nil)")
 				} else if errors.Is(readErr, context.Canceled) {
-					goroutineLogger.Warn("Context cancelled", "taskID", taskID, "streamKey", streamKey)
-					errMsg = fmt.Sprintf("%v", readErr)
+					goroutineLogger.Info("Context cancelled while waiting for result stream message.", "err", readErr)
+					errMsg = readErr.Error()
 				} else {
-					goroutineLogger.Error("Failed to read from stream", "taskID", taskID, "streamKey", streamKey, "err", readErr)
-					errMsg = fmt.Sprintf("failed to read from stream: %v", readErr)
+					goroutineLogger.Error("Failed to read from result stream", "err", readErr)
+					errMsg = fmt.Sprintf("failed to read from result stream: %v", readErr)
 				}
 				resultCh <- &Result{TaskID: taskID, Error: errMsg}
 				return
@@ -295,26 +362,26 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 
 			if len(cmdResult) > 0 && len(cmdResult[0].Messages) > 0 {
 				msg := cmdResult[0].Messages[0]
-				goroutineLogger.Info("Received stream message", "taskID", taskID, "streamKey", streamKey, "streamMessageID", msg.ID)
+				goroutineLogger.Info("Received message from result stream", "messageID", msg.ID)
 				var res Result
 				if val, ok := msg.Values["result"].(string); ok {
 					if umErr := json.Unmarshal([]byte(val), &res); umErr != nil {
-						goroutineLogger.Error("Failed to unmarshal received stream message", "taskID", taskID, "streamMessageID", msg.ID, "err", umErr)
-						resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("failed to unmarshal stream message: %v", umErr)}
+						goroutineLogger.Error("Failed to unmarshal received result stream message", "messageID", msg.ID, "err", umErr)
+						resultCh <- &Result{TaskID: taskID, Error: fmt.Sprintf("failed to unmarshal result stream message: %v", umErr)}
 					} else {
 						resultCh <- &res
 					}
 				} else {
-					goroutineLogger.Error("Received stream message 'result' field not a string", "taskID", taskID, "streamMessageID", msg.ID)
-					resultCh <- &Result{TaskID: taskID, Error: "received stream message 'result' field not a string"}
+					goroutineLogger.Error("Received result stream message 'result' field not a string", "messageID", msg.ID)
+					resultCh <- &Result{TaskID: taskID, Error: "received result stream message 'result' field not a string"}
 				}
 			} else {
-				errMsg := "received no message from stream unexpectedly"
-				if ctx.Err() == context.DeadlineExceeded {
-					goroutineLogger.Warn("XRead returned no message and no error, context deadline exceeded", "taskID", taskID, "streamKey", streamKey)
-					errMsg = "wait for stream message timed out (context check)"
+				errMsg := "received no message from result stream unexpectedly"
+				if errors.Is(waitResultCtx.Err(), context.DeadlineExceeded) {
+					goroutineLogger.Warn("XRead on result stream returned no message and no error, context deadline exceeded")
+					errMsg = fmt.Sprintf("wait for result stream message timed out after %v (context check)", q.config.ProducerResultWaitTimeout)
 				} else {
-					goroutineLogger.Error("XRead returned no message and no error (unexpected)", "taskID", taskID, "streamKey", streamKey)
+					goroutineLogger.Error("XRead on result stream returned no message and no error (unexpected)")
 				}
 				resultCh <- &Result{TaskID: taskID, Error: errMsg}
 			}
@@ -322,27 +389,23 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 		return nil, resultCh, nil
 	}
 
-	logger.Error("Unexpected state after processing task", "taskID", taskID, "action", action)
-	return nil, nil, fmt.Errorf("unexpected state after processing task %s, action: %s", taskID, action)
+	logger.Error("Unexpected state after producer logic, no action taken to wait for result.", "taskID", taskID, "action", action)
+	return nil, nil, fmt.Errorf("unexpected producer state for task %s, action: %s", taskID, action)
 }
 
 // ProduceBlock calls Produce and blocks until the result is available or an error occurs.
 func (q *Queue) ProduceBlock(ctx context.Context, taskID string, payload []byte) (*Result, error) {
-	logger := q.config.Logger // Use logger from config
+	logger := q.config.Logger
 	immediateResult, resultCh, err := q.Produce(ctx, taskID, payload)
 	if err != nil {
-		logger.Error("Produce failed in ProduceBlock", "taskID", taskID, "err", err)
 		return nil, fmt.Errorf("produce failed: %w", err)
 	}
-
 	if immediateResult != nil {
 		if immediateResult.Error != "" {
-			logger.Warn("ProduceBlock returning immediate result with error", "taskID", taskID, "resultError", immediateResult.Error)
 			return immediateResult, errors.New(immediateResult.Error)
 		}
 		return immediateResult, nil
 	}
-
 	if resultCh != nil {
 		select {
 		case finalResult, ok := <-resultCh:
@@ -355,139 +418,202 @@ func (q *Queue) ProduceBlock(ctx context.Context, taskID string, payload []byte)
 				return nil, errors.New("result channel delivered nil result")
 			}
 			if finalResult.Error != "" {
-				logger.Warn("ProduceBlock returning final result with error", "taskID", taskID, "resultError", finalResult.Error)
 				return finalResult, errors.New(finalResult.Error)
 			}
 			return finalResult, nil
 		case <-ctx.Done():
-			logger.Warn("ProduceBlock cancelled by context", "taskID", taskID, "err", ctx.Err())
+			logger.Warn("ProduceBlock cancelled by context while waiting for result channel", "taskID", taskID, "err", ctx.Err())
 			return nil, fmt.Errorf("produce block cancelled by context: %w", ctx.Err())
 		}
 	}
 	logger.Error("Produce returned neither immediate result nor channel in ProduceBlock", "taskID", taskID)
-	return nil, errors.New("produce returned neither immediate result nor channel")
+	return nil, errors.New("produce returned neither immediate result nor result channel")
 }
 
 // ProcessTaskFunc is a function type that handles task processing.
 type ProcessTaskFunc func(ctx context.Context, taskID string, payload []byte) ([]byte, error)
 
-// Consume processes tasks from the queue. Should be run in a goroutine.
+// Consume processes tasks from the queue using XREADGROUP.
 func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
-	logger := q.config.Logger // Use logger from config
-	queueKey := q.getKey(keyQueue)
-	logger.Info("Consumer starting", "queueKey", queueKey)
+	logger := q.config.Logger.With("consumerIdentifier", q.config.ConsumerIdentifier, "group", q.config.ConsumerGroupName, "taskStream", q.taskStreamKey)
+	logger.Info("Consumer starting")
+
+	logger.Info("Starting phase 1: processing own pending messages (from ID '0')")
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("Context cancelled during pending message processing phase.", "err", ctx.Err())
+			return
+		default:
+		}
+		messages, err := q.redisClient.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    q.config.ConsumerGroupName,
+			Consumer: q.config.ConsumerIdentifier,
+			Streams:  []string{q.taskStreamKey, "0"},
+			Count:    1,
+			Block:    0, // Non-blocking check for PEL
+		}).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				logger.Info("No more pending messages in PEL for this consumer.")
+				break
+			}
+			logger.Error("Error reading pending messages from task stream", "err", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		if len(messages) == 0 || len(messages[0].Messages) == 0 {
+			logger.Info("No more pending messages in PEL for this consumer (empty batch).")
+			break
+		}
+		q.processStreamMessages(ctx, messages[0].Messages, processFunc, logger)
+	}
+	logger.Info("Finished phase 1. Starting phase 2: processing new messages (from ID '>')")
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("Consumer context cancelled, shutting down.", "err", ctx.Err())
+			logger.Info("Context cancelled during new message processing phase.", "err", ctx.Err())
 			return
 		default:
 		}
 
-		taskIDs, err := q.redisClient.BRPop(ctx, 5*time.Second, queueKey).Result()
+		readGroupArgs := &redis.XReadGroupArgs{
+			Group:    q.config.ConsumerGroupName,
+			Consumer: q.config.ConsumerIdentifier,
+			Streams:  []string{q.taskStreamKey, ">"},
+			Count:    1,
+			Block:    5 * time.Second, // Redis server-side block. Go ctx will interrupt if it expires sooner.
+		}
+
+		streamMessages, err := q.redisClient.XReadGroup(ctx, readGroupArgs).Result()
 		if err != nil {
-			if errors.Is(err, redis.Nil) { // Timeout
-				logger.Info("Result is nil, consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
-				return
+			if errors.Is(err, redis.Nil) {
+				continue
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				logger.Info("Consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
+				logger.Info("Context cancelled or deadline exceeded while reading new messages.", "err", err)
 				return
 			}
-			logger.Warn("BRPOP error, continue trying.", "queueKey", queueKey, "err", err)
-			logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
-			time.Sleep(5 * time.Second)
+			logger.Error("Error reading new messages from task stream", "err", err)
+			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		if len(taskIDs) != 2 {
-			logger.Error("Unexpected BRPOP result", "result", taskIDs)
+		if len(streamMessages) > 0 && len(streamMessages[0].Messages) > 0 {
+			q.processStreamMessages(ctx, streamMessages[0].Messages, processFunc, logger)
+		}
+	}
+}
+
+// processStreamMessages helper to process a batch of messages and ACK them.
+func (q *Queue) processStreamMessages(ctx context.Context, msgs []redis.XMessage, processFunc ProcessTaskFunc, logger *slog.Logger) {
+	for _, msg := range msgs {
+		taskID, taskIDOk := msg.Values[taskStreamMessageFieldTaskID].(string)
+		payloadStr, payloadOk := msg.Values[taskStreamMessageFieldPayload].(string)
+
+		if !taskIDOk || !payloadOk {
+			logger.Error("Invalid message format in task stream: missing taskID or payload", "messageID", msg.ID, "values", msg.Values)
+			if ackErr := q.redisClient.XAck(ctx, q.taskStreamKey, q.config.ConsumerGroupName, msg.ID).Err(); ackErr != nil {
+				logger.Error("Failed to ACK malformed message", "messageID", msg.ID, "err", ackErr)
+			}
 			continue
 		}
-
-		taskID := taskIDs[1]
-		logger.Info("Consumer picked up task", "taskID", taskID)
+		payloadData := []byte(payloadStr)
+		msgLogger := logger.With("taskID", taskID, "messageID", msg.ID)
+		msgLogger.Info("Consumer picked up task from stream")
 
 		statusKey := q.getKey(keyStatus, taskID)
-		payloadKey := q.getKey(keyPayload, taskID)
 
-		consumeAction, err := consumeScript.Run(
-			ctx, q.redisClient,
-			[]string{statusKey},
-			taskID, taskStatusPending, taskStatusProcessing, int(q.config.TaskExpiry.Seconds()), taskStatusProcessing, taskStatusCompleted,
-		).Result()
+		// ARGV for Lua: 1:taskID, 2:old_status, 3:new_status, 4:expiry, 5:processing_check, 6:completed_check
+		scriptArgs := []interface{}{
+			taskID,                             // ARGV[1]
+			taskStatusPending,                  // ARGV[2] expected_old_status
+			taskStatusProcessing,               // ARGV[3] new_processing_status
+			int(q.config.TaskExpiry.Seconds()), // ARGV[4] expiry
+			taskStatusProcessing,               // ARGV[5] check_processing_status
+			taskStatusCompleted,                // ARGV[6] check_completed_status
+		}
+		actionCmd := consumeScript.Run(ctx, q.redisClient, []string{statusKey}, scriptArgs...)
+		consumeAction, err := actionCmd.Result()
 		if err != nil {
-			logger.Error("Consume script error, skipping task.", "taskID", taskID, "err", err)
+			msgLogger.Error("Consume script execution error. Task will not be processed by this attempt, and NOT ACKed. Will be retried or claimed later.", "err", err)
 			continue
 		}
-
 		actionStr, ok := consumeAction.(string)
 		if !ok {
 			logger.Error("Consume script returned non-string action, skipping task.", "taskID", taskID, "actionType", fmt.Sprintf("%T", consumeAction))
 			continue
 		}
-		logger.Info("Consume script returned action", "taskID", taskID, "action", actionStr)
+		msgLogger.Info("Consume script returned action", "action", actionStr)
 
-		if actionStr != "processing" {
-			logger.Info("Not processing task due to status from script, skipping.", "taskID", taskID, "action", actionStr)
-			continue
+		shouldProcess := false
+		switch actionStr {
+		case "processing":
+			shouldProcess = true
+		case "already_processing_by_self_or_claimed":
+			msgLogger.Info("Task status indicates already claimed or processing by self. Will ACK.")
+		case "already_done_or_processing_by_other":
+			msgLogger.Info("Task already completed, failed, or being processed by another. Will ACK.")
+		case "expired_or_missing":
+			msgLogger.Warn("Task status key was missing or expired when consumeScript ran. Will ACK.")
+		case "race_or_expired":
+			msgLogger.Warn("Consume script indicated a race or status key expiry during SET. Will ACK.")
+		case "invalid_status_unexpected":
+			fallthrough
+		default:
+			msgLogger.Error("Consume script returned unexpected action. Will ACK.", "action", actionStr)
 		}
 
-		payloadData, err := q.redisClient.Get(ctx, payloadKey).Bytes()
-		if err != nil {
-			errMsg := fmt.Sprintf("payload error: %v", err)
-			if errors.Is(err, redis.Nil) {
-				logger.Warn("Payload not found (likely expired), marking failed.", "taskID", taskID, "payloadKey", payloadKey)
-				errMsg = "payload expired before processing"
-			} else {
-				logger.Error("Failed to get payload, marking failed.", "taskID", taskID, "payloadKey", payloadKey, "err", err)
-			}
-			q.updateStatusAndStreamResult(ctx, taskID, taskStatusFailed, &Result{TaskID: taskID, Error: errMsg})
-			continue
-		}
-
-		logger.Info("Executing processing logic for task...", "taskID", taskID)
-		var resultData []byte
-		var processErr error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("Panic occurred, marking failed", "panic", r, "taskID", taskID)
-					processErr = fmt.Errorf("processFunc panic: %v", r)
-				}
+		if shouldProcess {
+			msgLogger.Info("Executing processing logic for task...")
+			var resultData []byte
+			var processErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						msgLogger.Error("Panic occurred during processFunc, marking task failed", "panic", r)
+						processErr = fmt.Errorf("processFunc panic: %v", r)
+					}
+				}()
+				resultData, processErr = processFunc(ctx, taskID, payloadData)
 			}()
-			resultData, processErr = processFunc(ctx, taskID, payloadData)
-		}()
 
-		var finalStatus string
-		var taskResult *Result
-
-		if processErr != nil {
-			logger.Error("Task processing failed", "taskID", taskID, "err", processErr)
-			finalStatus = taskStatusFailed
-			taskResult = &Result{TaskID: taskID, Error: processErr.Error()}
-		} else {
-			logger.Info("Task processing successful", "taskID", taskID)
-			finalStatus = taskStatusCompleted
-			taskResult = &Result{TaskID: taskID, Data: json.RawMessage(resultData)}
+			var finalStatus string
+			var taskResult *Result
+			if processErr != nil {
+				msgLogger.Error("Task processing failed", "err", processErr)
+				finalStatus = taskStatusFailed
+				taskResult = &Result{TaskID: taskID, Error: processErr.Error()}
+			} else {
+				msgLogger.Info("Task processing successful")
+				finalStatus = taskStatusCompleted
+				taskResult = &Result{TaskID: taskID, Data: json.RawMessage(resultData)}
+			}
+			q.updateStatusAndStreamResult(ctx, taskID, finalStatus, taskResult)
 		}
-		q.updateStatusAndStreamResult(ctx, taskID, finalStatus, taskResult)
+
+		if ackErr := q.redisClient.XAck(ctx, q.taskStreamKey, q.config.ConsumerGroupName, msg.ID).Err(); ackErr != nil {
+			msgLogger.Error("Failed to ACK message from task stream. This may lead to reprocessing.", "err", ackErr)
+		} else {
+			msgLogger.Info("Successfully ACKed message from task stream.")
+		}
 	}
 }
 
-// updateStatusAndStreamResult updates status, stores result, adds to stream, and sets stream expiry.
-func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, status string, result *Result) {
-	logger := q.config.Logger // Use logger from config
+// updateStatusAndStreamResult updates the task's final status, stores the result,
+// and publishes the result to the task-specific result stream for producers.
+func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, finalStatus string, result *Result) {
+	logger := q.config.Logger.With("taskID", taskID)
 	resultKey := q.getKey(keyResult, taskID)
 	statusKey := q.getKey(keyStatus, taskID)
-	streamKey := q.getKey(keyStreamResultFormat, taskID)
+	resultStreamKey := q.getKey(keyStreamResultFormat, taskID)
 
 	pipe := q.redisClient.Pipeline()
 
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
-		logger.Error("Failed to marshal final result for storage", "taskID", taskID, "err", err)
+		logger.Error("Failed to marshal final result for storage/streaming", "err", err)
 		errorResult := &Result{TaskID: taskID, Error: fmt.Sprintf("internal: failed to marshal final result: %v", err)}
 		resultJSON, _ = json.Marshal(errorResult)
 	}
@@ -495,32 +621,30 @@ func (q *Queue) updateStatusAndStreamResult(ctx context.Context, taskID string, 
 	if resultJSON != nil {
 		pipe.Set(ctx, resultKey, resultJSON, q.config.TaskExpiry)
 	}
-	pipe.Set(ctx, statusKey, status, q.config.TaskExpiry)
+	pipe.Set(ctx, statusKey, finalStatus, q.config.TaskExpiry)
 
 	if resultJSON != nil {
 		xaddArgs := &redis.XAddArgs{
-			Stream: streamKey,
+			Stream: resultStreamKey,
 			ID:     "*",
 			Values: map[string]interface{}{"result": string(resultJSON)},
 		}
 		pipe.XAdd(ctx, xaddArgs)
-		pipe.Expire(ctx, streamKey, q.config.TaskExpiry)
-		logger.Info("Queued XADD to stream and EXPIRE for stream key", "taskID", taskID, "streamKey", streamKey, "expiry", q.config.TaskExpiry)
+		pipe.Expire(ctx, resultStreamKey, q.config.TaskExpiry)
 	} else {
-		logger.Error("resultJSON is nil after attempting to marshal error, not adding to stream.", "taskID", taskID)
+		logger.Error("resultJSON is nil, not adding to result stream or setting keys.")
 	}
 
 	cmders, execErr := pipe.Exec(ctx)
 	if execErr != nil {
-		logger.Error("Pipeline failed for status/result/stream update", "taskID", taskID, "err", execErr)
-		// Log individual command errors if available
+		logger.Error("Pipeline failed for final status update, result storage, or result streaming", "err", execErr)
 		for i, cmder := range cmders {
 			if cmder.Err() != nil {
-				logger.Error("Pipeline command failed", "taskID", taskID, "commandIndex", i, "commandName", cmder.Name(), "commandErr", cmder.Err())
+				logger.Error("Pipeline command failed", "commandIndex", i, "commandName", cmder.Name(), "commandErr", cmder.Err())
 			}
 		}
 	} else {
-		logger.Info("Status updated, result stored, and result streamed.", "taskID", taskID, "newStatus", status, "streamKey", streamKey)
+		logger.Info("Task final status updated, result stored, and result published to result stream.", "finalStatus", finalStatus, "resultStreamKey", resultStreamKey)
 	}
 }
 
