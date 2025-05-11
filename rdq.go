@@ -38,13 +38,6 @@ type QueueConfig struct {
 	// Should be long enough to cover max processing time + waiting time.
 	TaskExpiry time.Duration
 
-	// ProducerWaitTimeout is the maximum time a producer will wait for a task result via Stream.
-	ProducerWaitTimeout time.Duration
-
-	// ConsumerBRPOPTimeout is the timeout for the blocking pop operation.
-	// A small non-zero timeout allows the consumer to check context cancellation periodically.
-	ConsumerBRPOPTimeout time.Duration
-
 	Name   string
 	Logger *slog.Logger // Logger instance for this queue
 }
@@ -52,29 +45,15 @@ type QueueConfig struct {
 // DefaultQueueConfig returns a QueueConfig with default values.
 func DefaultQueueConfig() QueueConfig {
 	return QueueConfig{
-		TaskExpiry:           5 * time.Minute,
-		ProducerWaitTimeout:  60 * time.Second,
-		ConsumerBRPOPTimeout: 1 * time.Second,
-		Name:                 "",
-		Logger:               slog.New(slog.NewJSONHandler(os.Stdout, nil)), // Default logger
+		TaskExpiry: 5 * time.Minute,
+		Name:       "",
+		Logger:     slog.New(slog.NewJSONHandler(os.Stdout, nil)), // Default logger
 	}
 }
 
 // WithTaskExpiry sets the TaskExpiry duration.
 func (qc QueueConfig) WithTaskExpiry(d time.Duration) QueueConfig {
 	qc.TaskExpiry = d
-	return qc
-}
-
-// WithProducerWaitTimeout sets the ProducerWaitTimeout duration.
-func (qc QueueConfig) WithProducerWaitTimeout(d time.Duration) QueueConfig {
-	qc.ProducerWaitTimeout = d
-	return qc
-}
-
-// WithConsumerBRPOPTimeout sets the ConsumerBRPOPTimeout duration.
-func (qc QueueConfig) WithConsumerBRPOPTimeout(d time.Duration) QueueConfig {
-	qc.ConsumerBRPOPTimeout = d
 	return qc
 }
 
@@ -265,12 +244,9 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 			goroutineLogger := q.config.Logger
 			defer close(resultCh)
 
-			waitOverallCtx, cancelOverallWait := context.WithTimeout(ctx, q.config.ProducerWaitTimeout)
-			defer cancelOverallWait()
-
 			goroutineLogger.Info("Attempting to fetch existing result or wait on stream", "taskID", taskID, "streamKey", streamKey)
 
-			existingMsgs, revRangeErr := q.redisClient.XRevRangeN(waitOverallCtx, streamKey, "+", "-", 1).Result()
+			existingMsgs, revRangeErr := q.redisClient.XRevRangeN(ctx, streamKey, "+", "-", 1).Result()
 			if revRangeErr == nil && len(existingMsgs) == 1 {
 				msg := existingMsgs[0]
 				var res Result
@@ -291,21 +267,24 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 				return
 			}
 
-			goroutineLogger.Info("No valid immediate result from XRevRange, proceeding to XREAD.", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout)
+			goroutineLogger.Info("No valid immediate result from XRevRange, proceeding to XREAD.", "taskID", taskID, "streamKey", streamKey)
 			xreadStartID := "0-0"
 			xreadArgs := &redis.XReadArgs{
 				Streams: []string{streamKey, xreadStartID},
 				Count:   1,
-				Block:   q.config.ProducerWaitTimeout,
+				Block:   0,
 			}
 
-			cmdResult, readErr := q.redisClient.XRead(waitOverallCtx, xreadArgs).Result()
+			cmdResult, readErr := q.redisClient.XRead(ctx, xreadArgs).Result()
 			if readErr != nil {
-				errMsg := fmt.Sprintf("wait for stream message timed out after %v", q.config.ProducerWaitTimeout)
-				if errors.Is(readErr, context.DeadlineExceeded) || (waitOverallCtx.Err() == context.DeadlineExceeded) {
-					goroutineLogger.Warn("Wait for stream message timed out (context deadline)", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout, "err", readErr)
+				errMsg := "wait for stream message timed out"
+				if errors.Is(readErr, context.DeadlineExceeded) || (ctx.Err() == context.DeadlineExceeded) {
+					goroutineLogger.Warn("Wait for stream message timed out (context deadline)", "taskID", taskID, "streamKey", streamKey, "err", readErr)
 				} else if errors.Is(readErr, redis.Nil) {
-					goroutineLogger.Warn("Wait for stream message timed out (XRead redis.Nil)", "taskID", taskID, "streamKey", streamKey, "timeout", q.config.ProducerWaitTimeout)
+					goroutineLogger.Warn("Wait for stream message timed out (XRead redis.Nil)", "taskID", taskID, "streamKey", streamKey)
+				} else if errors.Is(readErr, context.Canceled) {
+					goroutineLogger.Warn("Context cancelled", "taskID", taskID, "streamKey", streamKey)
+					errMsg = fmt.Sprintf("%v", readErr)
 				} else {
 					goroutineLogger.Error("Failed to read from stream", "taskID", taskID, "streamKey", streamKey, "err", readErr)
 					errMsg = fmt.Sprintf("failed to read from stream: %v", readErr)
@@ -331,9 +310,9 @@ func (q *Queue) Produce(ctx context.Context, taskID string, payload []byte) (*Re
 				}
 			} else {
 				errMsg := "received no message from stream unexpectedly"
-				if waitOverallCtx.Err() == context.DeadlineExceeded {
+				if ctx.Err() == context.DeadlineExceeded {
 					goroutineLogger.Warn("XRead returned no message and no error, context deadline exceeded", "taskID", taskID, "streamKey", streamKey)
-					errMsg = fmt.Sprintf("wait for stream message timed out after %v (context check)", q.config.ProducerWaitTimeout)
+					errMsg = "wait for stream message timed out (context check)"
 				} else {
 					goroutineLogger.Error("XRead returned no message and no error (unexpected)", "taskID", taskID, "streamKey", streamKey)
 				}
@@ -406,18 +385,19 @@ func (q *Queue) Consume(ctx context.Context, processFunc ProcessTaskFunc) {
 		default:
 		}
 
-		taskIDs, err := q.redisClient.BRPop(ctx, q.config.ConsumerBRPOPTimeout, queueKey).Result()
+		taskIDs, err := q.redisClient.BRPop(ctx, 5*time.Second, queueKey).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) { // Timeout
-				continue
+				logger.Info("Result is nil, consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
+				return
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				logger.Info("Consumer context cancelled or timed out during BRPOP, shutting down.", "err", err)
 				return
 			}
 			logger.Warn("BRPOP error, continue trying.", "queueKey", queueKey, "err", err)
-			// logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
-			// time.Sleep(5 * time.Second)
+			logger.Error("BRPOP error, retrying in 5 seconds.", "queueKey", queueKey, "err", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
 

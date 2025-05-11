@@ -131,19 +131,17 @@ func TestPublishNilPayloadSuccess(t *testing.T) {
 	defer cancel()
 
 	// Start a consumer in a goroutine
-	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
-	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		queue.Consume(consumerCtx, MockProcessTaskSuccessWithNilResult)
+		log.Printf("consumer start")
+		queue.Consume(ctx, MockProcessTaskSuccessWithNilResult)
+		log.Printf("consumer done")
 	}()
 
 	taskID := "test-task-nil-payload-1"
 	var payload []byte = nil
 
 	// Publish the task and block for the result
+	log.Printf("publish task")
 	result, err := queue.ProduceBlock(ctx, taskID, payload)
 
 	// Assert no error from ProduceBlock
@@ -159,10 +157,6 @@ func TestPublishNilPayloadSuccess(t *testing.T) {
 	status, err := redisClient.Get(ctx, statusKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, taskStatusCompleted, status, "Task status in Redis should be completed")
-
-	// Clean up the consumer goroutine
-	cancelConsumer()
-	wg.Wait()
 }
 
 // TestPublishNewTaskSuccess tests publishing a new task that succeeds.
@@ -184,10 +178,7 @@ func TestPublishNewTaskSuccess(t *testing.T) {
 	// Start a consumer in a goroutine
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskSuccess)
 	}()
 
@@ -219,7 +210,6 @@ func TestPublishNewTaskSuccess(t *testing.T) {
 
 	// Clean up the consumer goroutine
 	cancelConsumer()
-	wg.Wait()
 }
 
 // TestPublishNewTaskFailure tests publishing a new task that fails.
@@ -239,10 +229,7 @@ func TestPublishNewTaskFailure(t *testing.T) {
 
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskFailure) // Use failure mock
 	}()
 
@@ -270,7 +257,6 @@ func TestPublishNewTaskFailure(t *testing.T) {
 	assert.Equal(t, taskStatusFailed, status, "Task status in Redis should be failed")
 
 	cancelConsumer()
-	wg.Wait()
 }
 
 // TestPublishDuplicateTaskWaiting tests publishing a duplicate task while the original is processing.
@@ -291,10 +277,7 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	// Start a consumer using the long-running mock
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskLong) // Use long-running mock
 	}()
 
@@ -371,7 +354,6 @@ func TestPublishDuplicateTaskWaiting(t *testing.T) {
 	}
 
 	cancelConsumer()
-	wg.Wait()
 }
 
 // TestPublishDuplicateTaskCompleted tests publishing a duplicate task after the original is completed.
@@ -392,10 +374,7 @@ func TestPublishDuplicateTaskCompleted(t *testing.T) {
 	// Start a consumer
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskSuccess)
 	}()
 
@@ -437,7 +416,6 @@ func TestPublishDuplicateTaskCompleted(t *testing.T) {
 	assert.Equal(t, taskStatusCompleted, status, "Task status in Redis should be completed")
 
 	cancelConsumer()
-	wg.Wait()
 }
 
 // TestPublishDuplicateTaskFailed tests publishing a duplicate task after the original failed.
@@ -458,10 +436,7 @@ func TestPublishDuplicateTaskFailed(t *testing.T) {
 	// Start a consumer using the failure mock
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskFailure) // Use failure mock
 	}()
 
@@ -501,7 +476,6 @@ func TestPublishDuplicateTaskFailed(t *testing.T) {
 	assert.Equal(t, taskStatusFailed, status, "Task status in Redis should be failed")
 
 	cancelConsumer()
-	wg.Wait()
 }
 
 // TestProducerTimeout tests that ProduceBlock times out if the task takes too long.
@@ -510,7 +484,6 @@ func TestProducerTimeout(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config, but override ProducerWaitTimeout
 	config := DefaultQueueConfig()
-	config.ProducerWaitTimeout = 1 * time.Second
 	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, queue.Name())
@@ -518,16 +491,13 @@ func TestProducerTimeout(t *testing.T) {
 	}()
 
 	// Use a context for the producer
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Test context longer than producer timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second) // Test context longer than producer timeout
 	defer cancel()
 
 	// Start a consumer using the long-running mock
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		queue.Consume(consumerCtx, MockProcessTaskLong) // Use long-running mock (3 seconds)
 	}()
 
@@ -539,8 +509,7 @@ func TestProducerTimeout(t *testing.T) {
 
 	// ProduceBlock should return an error due to the timeout
 	require.Error(t, err, "ProduceBlock should return an error due to timeout")
-	assert.Contains(t, err.Error(), "wait for stream message timed out after", "Error message should indicate waiting timeout")
-	assert.Contains(t, err.Error(), config.ProducerWaitTimeout.String(), "Error message should contain the configured timeout duration")
+	assert.Contains(t, err.Error(), "context deadline exceeded", "Error message should indicate waiting timeout")
 	// assert.Nil(t, result, "ProduceBlock should return a nil result on timeout")
 
 	// Give the long task a moment to potentially finish in the background
@@ -554,7 +523,33 @@ func TestProducerTimeout(t *testing.T) {
 	assert.Equal(t, taskStatusCompleted, status, "Task status in Redis should eventually be completed")
 
 	cancelConsumer()
-	wg.Wait()
+}
+
+func TestProduceCancellation(t *testing.T) {
+	redisClient := setupTestRedisClient(t)
+	defer redisClient.Close()
+	// Use default config for the test
+	config := DefaultQueueConfig()
+	queue := NewQueue(redisClient, config)
+	defer func() {
+		err := cleanupKeysForQueue(redisClient, queue.Name())
+		require.NoError(t, err)
+	}()
+
+	// Use a context for the producer that we will cancel
+	ctx, cancelProducer := context.WithCancel(context.Background())
+	now := time.Now()
+
+	go func() {
+		<-time.After(1 * time.Second)
+		cancelProducer()
+	}()
+	taskID := "test-producer-cancel"
+	payload := []byte(`{"data": "should stay in queue"}`)
+	_, err := queue.ProduceBlock(ctx, taskID, payload)
+	require.Error(t, err)
+	require.True(t, time.Since(now) < 2*time.Second)
+	require.True(t, errors.Is(err, context.Canceled))
 }
 
 // TestConsumerCancellation tests that a consumer shuts down when its context is cancelled.
@@ -633,8 +628,7 @@ func TestTaskExpiryBeforeProcessing(t *testing.T) {
 	defer redisClient.Close()
 	// Use default config for the test
 	config := DefaultQueueConfig()
-	config.TaskExpiry = 2 * time.Second
-	config.ProducerWaitTimeout = 1 * time.Second
+	config.TaskExpiry = 1 * time.Second
 	queue := NewQueue(redisClient, config)
 	defer func() {
 		err := cleanupKeysForQueue(redisClient, queue.Name())
@@ -728,8 +722,7 @@ func TestRedisConnectionFailure(t *testing.T) {
 
 	// Attempt to consume (will block and eventually error or timeout)
 	// This needs to be run in a goroutine as BRPOP is blocking
-	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
-	defer cancelConsumer() // Ensure cancellation
+	consumerCtx := t.Context() // Ensure cancellation
 
 	go func() {
 		// Consume will loop and retry BRPOP, eventually hitting errors
@@ -771,8 +764,7 @@ func TestMultipleConsumers(t *testing.T) {
 
 	// Start multiple consumers
 	consumerCtx, cancelConsumers := context.WithCancel(context.Background())
-	defer cancelConsumers()
-	for i := 0; i < numConsumers; i++ {
+	for i := range numConsumers {
 		go func(id int) {
 			defer consumerWg.Done()
 			log.Printf("Starting Consumer %d", id)
@@ -792,10 +784,10 @@ func TestMultipleConsumers(t *testing.T) {
 
 	// Publish multiple unique tasks
 	go func() {
-		for i := 0; i < numTasks; i++ {
+		for i := range numTasks {
 			taskID := fmt.Sprintf("test-multiple-consumers-%d", i)
 			taskIDs[taskID] = struct{}{} // Keep track of published IDs
-			payload := []byte(fmt.Sprintf(`{"task_num": %d}`, i))
+			payload := fmt.Appendf(nil, `{"task_num": %d}`, i)
 
 			go func(id string, p []byte) {
 				defer producerWg.Done()
@@ -813,6 +805,7 @@ func TestMultipleConsumers(t *testing.T) {
 	// Wait for all producers to finish submitting/waiting
 	producerWg.Wait()
 	log.Println("All producers finished submitting/waiting.")
+	cancelConsumers()
 
 	// Collect results from the channel
 	receivedResults := make(map[string]*Result)
@@ -840,8 +833,6 @@ func TestMultipleConsumers(t *testing.T) {
 		// Optionally, check the content of result.Data
 	}
 
-	// Clean up consumers
-	cancelConsumers()
 	consumerWg.Wait()
 }
 
